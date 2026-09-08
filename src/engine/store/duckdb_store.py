@@ -1,0 +1,358 @@
+"""Canonical store: one embedded DuckDB database per client.
+
+Per-client database files (rather than a shared database with a tenant column)
+keep tenant isolation a property of the filesystem layout, which is the boundary
+the multi-tenancy design calls for later.
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import duckdb
+import polars as pl
+
+from engine.config.loader import project_root
+
+DDL = """
+CREATE SEQUENCE IF NOT EXISTS run_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS dim_series (
+    client_id            VARCHAR NOT NULL,
+    series_id            VARCHAR NOT NULL,
+    customer             VARCHAR,
+    item_code            VARCHAR,
+    description          VARCHAR,
+    item_group           VARCHAR,
+    source_sheet         VARCHAR,
+    uom                  VARCHAR,
+    ground_truth_pattern VARCHAR,
+    source_file          VARCHAR NOT NULL,
+    ingested_at          TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fact_demand (
+    client_id   VARCHAR NOT NULL,
+    series_id   VARCHAR NOT NULL,
+    period      DATE NOT NULL,
+    quantity    DOUBLE NOT NULL,
+    source_file VARCHAR NOT NULL,
+    ingested_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS series_profile (
+    client_id         VARCHAR NOT NULL,
+    series_id         VARCHAR NOT NULL,
+    n_periods         BIGINT,
+    n_zeros           BIGINT,
+    zero_fraction     DOUBLE,
+    mean_demand       DOUBLE,
+    cv                DOUBLE,
+    adi               DOUBLE,
+    cv2               DOUBLE,
+    trend_strength    DOUBLE,
+    seasonal_strength DOUBLE,
+    residual_cv       DOUBLE,
+    slope             DOUBLE,
+    pattern           VARCHAR,
+    computed_at       TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id     BIGINT PRIMARY KEY,
+    client_id  VARCHAR NOT NULL,
+    run_type   VARCHAR NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    config     VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS backtest_predictions (
+    run_id        BIGINT NOT NULL,
+    model         VARCHAR NOT NULL,
+    origin        INTEGER NOT NULL,
+    cutoff_period DATE NOT NULL,
+    series_id     VARCHAR NOT NULL,
+    period        DATE NOT NULL,
+    horizon       INTEGER NOT NULL,
+    actual        DOUBLE,
+    forecast      DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS backtest_metrics (
+    run_id      BIGINT NOT NULL,
+    model       VARCHAR NOT NULL,
+    scope_type  VARCHAR NOT NULL,
+    scope_value VARCHAR NOT NULL,
+    metric      VARCHAR NOT NULL,
+    value       DOUBLE,
+    n_obs       BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS model_selection (
+    run_id    BIGINT NOT NULL,
+    series_id VARCHAR NOT NULL,
+    model     VARCHAR NOT NULL,
+    score     DOUBLE,
+    metric    VARCHAR NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS forecasts (
+    run_id        BIGINT NOT NULL,
+    client_id     VARCHAR NOT NULL,
+    series_id     VARCHAR NOT NULL,
+    cutoff_period DATE NOT NULL,
+    period        DATE NOT NULL,
+    horizon       INTEGER NOT NULL,
+    model         VARCHAR NOT NULL,
+    forecast      DOUBLE
+);
+
+CREATE TABLE IF NOT EXISTS pattern_validation (
+    run_id        BIGINT NOT NULL,
+    ground_truth  VARCHAR,
+    predicted     VARCHAR,
+    n             BIGINT
+);
+"""
+
+
+class EngineStore:
+    """Thin, explicit persistence layer. All SQL lives here."""
+
+    def __init__(self, client_id: str, root: Path | None = None) -> None:
+        self.client_id = client_id
+        base = root or project_root() / "data" / "processed"
+        self.dir = base / client_id
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / "engine.duckdb"
+
+    @contextmanager
+    def connect(self):
+        con = duckdb.connect(str(self.path))
+        try:
+            yield con
+        finally:
+            con.close()
+
+    def init_schema(self) -> None:
+        with self.connect() as con:
+            con.execute(DDL)
+
+    # ------------------------------------------------------------------ ingest
+
+    def replace_source(self, dim: pl.DataFrame, fact: pl.DataFrame) -> None:
+        """Idempotent load: re-ingesting the same file replaces its rows exactly.
+
+        The source file is read from the incoming frames rather than passed in,
+        so the rows deleted and the rows inserted can never refer to different
+        files.
+        """
+        self.init_schema()
+        source_files = fact["source_file"].unique().to_list()
+
+        with self.connect() as con:
+            con.register("incoming_dim", dim)
+            con.register("incoming_fact", fact)
+            con.execute("BEGIN TRANSACTION")
+            for source_file in source_files:
+                con.execute(
+                    "DELETE FROM dim_series WHERE client_id = ? AND source_file = ?",
+                    [self.client_id, source_file],
+                )
+                con.execute(
+                    "DELETE FROM fact_demand WHERE client_id = ? AND source_file = ?",
+                    [self.client_id, source_file],
+                )
+            con.execute("INSERT INTO dim_series SELECT * FROM incoming_dim")
+            con.execute("INSERT INTO fact_demand SELECT * FROM incoming_fact")
+            con.execute("COMMIT")
+
+        self._export_parquet(dim, fact)
+
+    def _export_parquet(self, dim: pl.DataFrame, fact: pl.DataFrame) -> None:
+        canonical = self.dir / "canonical"
+        canonical.mkdir(parents=True, exist_ok=True)
+        dim.write_parquet(canonical / "dim_series.parquet")
+        fact.write_parquet(canonical / "fact_demand.parquet")
+
+    def load_dim(self) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute(
+                "SELECT * FROM dim_series WHERE client_id = ? ORDER BY series_id",
+                [self.client_id],
+            ).pl()
+
+    def load_fact(self) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute(
+                "SELECT client_id, series_id, period, quantity FROM fact_demand "
+                "WHERE client_id = ? ORDER BY series_id, period",
+                [self.client_id],
+            ).pl()
+
+    def table_exists(self, name: str) -> bool:
+        if not self.path.exists():
+            return False
+        with self.connect() as con:
+            rows = con.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [name]
+            ).fetchall()
+        return bool(rows)
+
+    # ---------------------------------------------------------------- profiles
+
+    def write_series_profiles(self, profiles: pl.DataFrame) -> None:
+        self.init_schema()
+        frame = profiles.with_columns(
+            pl.lit(self.client_id).alias("client_id"),
+            pl.lit(datetime.now()).alias("computed_at"),
+        ).select(
+            "client_id",
+            "series_id",
+            "n_periods",
+            "n_zeros",
+            "zero_fraction",
+            "mean_demand",
+            "cv",
+            "adi",
+            "cv2",
+            "trend_strength",
+            "seasonal_strength",
+            "residual_cv",
+            "slope",
+            "pattern",
+            "computed_at",
+        )
+        with self.connect() as con:
+            con.register("incoming_profiles", frame)
+            con.execute("DELETE FROM series_profile WHERE client_id = ?", [self.client_id])
+            con.execute("INSERT INTO series_profile SELECT * FROM incoming_profiles")
+
+    def load_series_profiles(self) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute(
+                "SELECT * FROM series_profile WHERE client_id = ? ORDER BY series_id",
+                [self.client_id],
+            ).pl()
+
+    # -------------------------------------------------------------------- runs
+
+    def start_run(self, run_type: str, config: dict[str, Any] | None = None) -> int:
+        self.init_schema()
+        with self.connect() as con:
+            run_id = con.execute("SELECT nextval('run_id_seq')").fetchone()[0]
+            con.execute(
+                "INSERT INTO runs VALUES (?, ?, ?, ?, ?)",
+                [
+                    run_id,
+                    self.client_id,
+                    run_type,
+                    datetime.now(),
+                    json.dumps(config or {}, default=str),
+                ],
+            )
+        return int(run_id)
+
+    def latest_run(self, run_type: str) -> int | None:
+        if not self.table_exists("runs"):
+            return None
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT run_id FROM runs WHERE client_id = ? AND run_type = ? "
+                "ORDER BY run_id DESC LIMIT 1",
+                [self.client_id, run_type],
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def run_info(self, run_id: int) -> dict[str, Any] | None:
+        with self.connect() as con:
+            row = con.execute("SELECT * FROM runs WHERE run_id = ?", [run_id]).pl()
+        return row.to_dicts()[0] if not row.is_empty() else None
+
+    # --------------------------------------------------------------- backtest
+
+    def write_backtest_predictions(self, run_id: int, predictions: pl.DataFrame) -> None:
+        frame = predictions.with_columns(pl.lit(run_id, dtype=pl.Int64).alias("run_id")).select(
+            "run_id",
+            "model",
+            "origin",
+            "cutoff_period",
+            "series_id",
+            "period",
+            "horizon",
+            "actual",
+            "forecast",
+        )
+        with self.connect() as con:
+            con.register("incoming_preds", frame)
+            con.execute("INSERT INTO backtest_predictions SELECT * FROM incoming_preds")
+
+    def load_backtest_predictions(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute("SELECT * FROM backtest_predictions WHERE run_id = ?", [run_id]).pl()
+
+    def write_metrics(self, run_id: int, metrics: pl.DataFrame) -> None:
+        frame = metrics.with_columns(pl.lit(run_id, dtype=pl.Int64).alias("run_id")).select(
+            "run_id", "model", "scope_type", "scope_value", "metric", "value", "n_obs"
+        )
+        with self.connect() as con:
+            con.register("incoming_metrics", frame)
+            con.execute("INSERT INTO backtest_metrics SELECT * FROM incoming_metrics")
+
+    def load_metrics(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute("SELECT * FROM backtest_metrics WHERE run_id = ?", [run_id]).pl()
+
+    def write_model_selection(self, run_id: int, selection: pl.DataFrame) -> None:
+        frame = selection.with_columns(pl.lit(run_id, dtype=pl.Int64).alias("run_id")).select(
+            "run_id", "series_id", "model", "score", "metric"
+        )
+        with self.connect() as con:
+            con.register("incoming_selection", frame)
+            con.execute("INSERT INTO model_selection SELECT * FROM incoming_selection")
+
+    def load_model_selection(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute("SELECT * FROM model_selection WHERE run_id = ?", [run_id]).pl()
+
+    def write_pattern_validation(self, run_id: int, matrix: pl.DataFrame) -> None:
+        frame = matrix.with_columns(pl.lit(run_id, dtype=pl.Int64).alias("run_id")).select(
+            "run_id", "ground_truth", "predicted", "n"
+        )
+        with self.connect() as con:
+            con.register("incoming_pattern_val", frame)
+            con.execute("INSERT INTO pattern_validation SELECT * FROM incoming_pattern_val")
+
+    def load_pattern_validation(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute("SELECT * FROM pattern_validation WHERE run_id = ?", [run_id]).pl()
+
+    # -------------------------------------------------------------- forecasts
+
+    def write_forecasts(self, run_id: int, forecasts: pl.DataFrame) -> None:
+        frame = forecasts.with_columns(
+            pl.lit(run_id, dtype=pl.Int64).alias("run_id"),
+            pl.lit(self.client_id).alias("client_id"),
+        ).select(
+            "run_id",
+            "client_id",
+            "series_id",
+            "cutoff_period",
+            "period",
+            "horizon",
+            "model",
+            "forecast",
+        )
+        with self.connect() as con:
+            con.register("incoming_forecasts", frame)
+            con.execute("INSERT INTO forecasts SELECT * FROM incoming_forecasts")
+
+    def load_forecasts(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute(
+                "SELECT * FROM forecasts WHERE run_id = ? ORDER BY series_id, period", [run_id]
+            ).pl()

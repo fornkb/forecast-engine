@@ -1,0 +1,65 @@
+client_id: teknic_mumbai
+display_name: "Teknic — Mumbai Operations"
+currency: INR
+
+source:
+  reader: excel_demand
+  sheet: null # null = first sheet in the workbook
+  column_map:
+    series_id: "Series ID"
+    customer: "Customer"
+    item_code: "Item Code"
+    description: "Description"
+    item_group: "Item Group"
+    period: "Demand Month"
+    quantity: "Demand Quantity"
+    uom: "UOM"
+    source_sheet: "Source Sheet"
+    ground_truth_pattern: "Demand Pattern" # validation only, never a model feature
+
+calendar:
+  granularity: monthly
+  fiscal_year_start_month: 4
+
+hierarchy:
+  series_key: [customer, item_code]
+  grouping_keys: # independent axes, not levels of one tree
+    - item_group
+    - source_sheet
+
+evaluation:
+  horizon: 3
+  origins: 3
+  origin_step: 1
+  min_train_periods: 24
+
+patterns:
+  zero_fraction_intermittent: 0.30
+  adi_intermittent: 1.32
+  seasonal_strength: 0.88
+  trend_strength: 0.60
+  volatility_cv: 0.15
+
+models:
+  enabled:
+    - seasonal_naive
+    - naive
+    - auto_ets
+    - croston
+    - lightgbm_global
+  baseline: seasonal_naive # Forecast Value Add reference
+  static_features: # categorical attributes the pooled model may learn from
+    - customer
+    - item_group
+    - source_sheet
+  lightgbm:
+    objective: l1
+    learning_rate: 0.05
+    num_leaves: 31
+    min_data_in_leaf: 20
+    num_boost_round: 400
+
+# Populated in Phase 2 (context layer) and the decision layer — present now so
+# those phases extend this file instead of replacing it.
+exogenous_signals: []
+cost_model: null
