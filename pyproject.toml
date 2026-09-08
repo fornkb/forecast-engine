@@ -18,6 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Pulls in PyTorch (~3 GB). Kept separable so a deployment that only wants the
+# classical portfolio can skip it — drop chronos2 from models.enabled to match.
+foundation = [
+    "chronos-forecasting>=2.0",
+]
 dev = [
     "pytest>=8.3",
     "ruff>=0.9",
@@ -43,3 +48,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# Tests that load pretrained model weights are excluded by default; run them
+# with `pytest -m slow`.
+addopts = "-m 'not slow'"
+markers = ["slow: loads pretrained model weights (needs the model cached)"]

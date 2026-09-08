@@ -88,6 +88,36 @@ class PatternThresholds(StrictModel):
     volatility_cv: float = Field(default=0.15, ge=0)
 
 
+class SegmentThresholds(StrictModel):
+    """Cumulative volume-share boundaries for Head / Mid / Tail segmentation.
+
+    Defaults follow the conventional Pareto split: the head is whatever few
+    series carry the first 80% of demand, the tail the last 5%.
+    """
+
+    head_share: float = Field(default=0.80, gt=0, lt=1)
+    mid_share: float = Field(default=0.95, gt=0, lt=1)
+
+    def model_post_init(self, _context) -> None:
+        if self.mid_share <= self.head_share:
+            raise ValueError("segments.mid_share must be greater than segments.head_share")
+
+
+class ChronosParams(StrictModel):
+    """Zero-shot foundation model settings.
+
+    The model is pretrained and never fitted here, so there are no training
+    hyperparameters — only what to load and how to run it.
+    """
+
+    model_id: str = "amazon/chronos-2"
+    device: Literal["cpu", "cuda", "auto"] = "cpu"
+    # The median is taken as the point forecast; the outer levels are retained
+    # because Phase 2's conformal intervals calibrate against them.
+    quantile_levels: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
+    batch_size: int = Field(default=64, ge=1)
+
+
 class LightGBMParams(StrictModel):
     objective: str = "l1"
     learning_rate: float = 0.05
@@ -112,6 +142,15 @@ class ArbitrationConfig(StrictModel):
 
     selection_metric: Literal["mae", "wape"] = "mae"
     min_improvement_pct: float = Field(default=15.0, ge=0, le=100)
+    # Which slice each series inherits its default model from. A single global
+    # default is wrong for one group or another once the portfolio holds models
+    # with complementary strengths across volume or demand pattern.
+    stratify_by: Literal["none", "volume_segment", "pattern"] = "volume_segment"
+    # The champion is the default for a *typical* series in its stratum, so it is
+    # scored with the scale-free metric. Aggregate MAE within a stratum is
+    # dominated by its few largest series, which answers a different question;
+    # those series can still override the default through per-series selection.
+    champion_metric: Literal["median_series_wape", "mae", "wape"] = "median_series_wape"
 
 
 class ModelsConfig(StrictModel):
@@ -128,6 +167,7 @@ class ModelsConfig(StrictModel):
             "auto_ets",
             "croston",
             "lightgbm_global",
+            "chronos2",
         ]
     )
     baseline: str = "seasonal_naive"
@@ -138,6 +178,7 @@ class ModelsConfig(StrictModel):
     )
     arbitration: ArbitrationConfig = Field(default_factory=ArbitrationConfig)
     lightgbm: LightGBMParams = Field(default_factory=LightGBMParams)
+    chronos: ChronosParams = Field(default_factory=ChronosParams)
 
     @field_validator("enabled")
     @classmethod
@@ -156,6 +197,7 @@ class ClientProfile(StrictModel):
     hierarchy: HierarchyConfig = Field(default_factory=HierarchyConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     patterns: PatternThresholds = Field(default_factory=PatternThresholds)
+    segments: SegmentThresholds = Field(default_factory=SegmentThresholds)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
 
     # Reserved for later phases so their arrival does not break this schema.

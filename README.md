@@ -1,12 +1,22 @@
-# Forecast Engine — Phase 0
+# Forecast Engine
 
-ERP-native demand forecasting engine. Phase 0 delivers the data layer, a baseline
-model portfolio, and the evaluation scoreboard — terminal-driven, no UI.
+ERP-native demand forecasting engine. Terminal-driven, no UI.
 
-There are deliberately **no LLMs, agents, or foundation models** in this phase.
-Its job is to establish the bar that later phases must beat: every model is
-scored against a seasonal-naive baseline on a rolling-origin backtest, so the
-value added by anything more sophisticated becomes provable rather than assumed.
+**Phase 0** delivered the data layer, a baseline model portfolio, and the
+evaluation scoreboard — the bar every later phase has to beat.
+
+**Phase 1** adds Chronos-2, a pretrained time-series foundation model, and the
+machinery to prove where it actually helps: volume segmentation, stratified
+arbitration, and a cold-start experiment. It earns its place on the long tail and
+on short history, not across the board — see
+[What Phase 1 measured](#13-what-phase-1-measured).
+
+There are still **no LLMs and no agents** here. Chronos-2 is a pretrained
+forecasting model, not a language model; the LLM-driven context and explanation
+layers belong to later phases.
+
+Every model is scored against a seasonal-naive baseline on a rolling-origin
+backtest, so added sophistication has to prove itself rather than be assumed.
 
 ---
 
@@ -24,6 +34,7 @@ value added by anything more sophisticated becomes provable rather than assumed.
 10. [Project structure](#10-project-structure)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Scope and limits](#12-scope-and-limits)
+13. [What Phase 1 measured](#13-what-phase-1-measured)
 
 ---
 
@@ -33,8 +44,9 @@ value added by anything more sophisticated becomes provable rather than assumed.
 | --- | --- |
 | Python 3.11 or newer | Developed and tested on 3.13.2 |
 | Git | To clone the repository |
-| ~1 GB free disk | Mostly the virtual environment (LightGBM, statsforecast, Polars) |
-| CPU only | No GPU required. No network access needed after install |
+| ~4 GB free disk | Virtual environment (~3 GB, mostly PyTorch) plus ~500 MB of model weights |
+| CPU only | No GPU required — Chronos-2 forecasts all 297 series in ~1.6s on CPU |
+| Network, first run only | Chronos-2 weights download from Hugging Face once, then cache |
 
 Check your Python version:
 
@@ -57,7 +69,7 @@ down.
 git clone https://github.com/plutoTaco/forecast-engine.git
 cd forecast-engine
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.venv\Scripts\python.exe -m pip install -e ".[dev,foundation]"
 .venv\Scripts\engine.exe ingest   --client teknic_mumbai --file data\raw\Demand_History_3_Years.xlsx
 .venv\Scripts\engine.exe features --client teknic_mumbai
 .venv\Scripts\engine.exe backtest --client teknic_mumbai
@@ -69,7 +81,7 @@ python -m venv .venv
 git clone https://github.com/plutoTaco/forecast-engine.git
 cd forecast-engine
 python3 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install -e ".[dev,foundation]"
 .venv/bin/engine ingest   --client teknic_mumbai --file data/raw/Demand_History_3_Years.xlsx
 .venv/bin/engine features --client teknic_mumbai
 .venv/bin/engine backtest --client teknic_mumbai
@@ -117,24 +129,28 @@ without reinstalling.
 **Windows:**
 
 ```powershell
-.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.venv\Scripts\python.exe -m pip install -e ".[dev,foundation]"
 ```
 
 **macOS / Linux:**
 
 ```bash
-.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install -e ".[dev,foundation]"
 ```
 
 **With uv** (note the explicit `--python` flag — without it, uv may target your
 system Python instead of the virtual environment):
 
 ```bash
-uv pip install --python .venv/Scripts/python.exe -e ".[dev]"   # Windows
-uv pip install --python .venv/bin/python -e ".[dev]"           # macOS / Linux
+uv pip install --python .venv/Scripts/python.exe -e ".[dev,foundation]"   # Windows
+uv pip install --python .venv/bin/python -e ".[dev,foundation]"           # macOS / Linux
 ```
 
-`[dev]` adds `pytest` and `ruff`. Omit it for a runtime-only install.
+`[dev]` adds `pytest` and `ruff`; omit it for a runtime-only install.
+`[foundation]` adds Chronos-2 and PyTorch (~3 GB). To skip it, install plain
+`-e "."` and remove `chronos2` from `models.enabled` in the client profile — the
+rest of the portfolio runs without it, and the engine will tell you clearly if
+the model is enabled but not installed.
 
 ### 3.4 Activating the environment (optional but convenient)
 
@@ -165,8 +181,8 @@ activated** — if it isn't, prefix commands with `.venv\Scripts\` (Windows) or
 engine --help
 ```
 
-You should see the list of commands: `backtest`, `clients`, `features`,
-`forecast`, `ingest`, `report`.
+You should see the list of commands: `backtest`, `clients`, `coldstart`,
+`features`, `forecast`, `ingest`, `report`.
 
 ---
 
@@ -210,6 +226,7 @@ Expected output:
 ```
 -> Profiling 297 series
    detected patterns: Seasonal 52, Growing 49, Declining 49, Stable 49, Intermittent 49, Volatile 49
+   volume segments: Head 20 series / 79.6% of volume, Mid 51 series / 15.4%, Tail 226 series / 5.0%
 
 Pattern classifier — agreement with source labels: 99.3% (gate: 75%)
 ```
@@ -217,6 +234,10 @@ Pattern classifier — agreement with source labels: 99.3% (gate: 75%)
 …followed by a confusion matrix. Because the sample file carries ground-truth
 pattern labels, the classifier can be scored rather than trusted. Real client
 data will not have those labels, and the agreement line is simply skipped.
+
+The volume segments are a textbook Pareto curve — 20 series carry 80% of demand
+while 226 carry the last 5%. That split matters because models differ sharply
+across it.
 
 ### Step 3 — Backtest
 
@@ -227,18 +248,36 @@ scoreboard. This is the slow step, roughly 31 seconds.
 engine backtest --client teknic_mumbai
 ```
 
-It prints five tables:
+It prints:
 
 | Table | What it tells you |
 | --- | --- |
 | Accuracy across all origins | Every model's error, and its Forecast Value Add against the baseline |
 | FVA by demand pattern (volume-weighted) | Where each model wins or loses, weighted by volume |
 | FVA by demand pattern (median series WAPE) | The same, with every series weighted equally |
+| FVA by volume segment | Head / Mid / Tail — where foundation models earn their place |
 | Final held-out origin | The honest portfolio number — scored on an origin it was not selected on |
+| Portfolio by pattern and by segment | The phase-gate view: the portfolio must not lose on any slice |
 | Arbitration | Which model won how many series |
 
-The headline result: **portfolio +45.9% FVA** over seasonal-naive on the
-held-out origin.
+The headline result: **portfolio +45.7% FVA** over seasonal-naive on the
+held-out origin, with a median series WAPE of 0.120.
+
+It also prints the default model chosen for each volume segment, e.g.
+`Head -> lightgbm_global, Mid -> lightgbm_global, Tail -> chronos2`.
+
+### Step 3b — Cold-start experiment
+
+```bash
+engine coldstart --client teknic_mumbai
+```
+
+Re-runs the backtest with each series truncated to 3, 6, 12, 24, and 36 periods
+of history, showing how each model degrades as history runs out. This is the
+experiment that justifies including a foundation model at all — see
+[What Phase 1 measured](#13-what-phase-1-measured). Takes a few minutes.
+
+`engine backtest --max-history N` runs a single depth if you want just one.
 
 ### Step 4 — Forecast
 
@@ -332,11 +371,15 @@ Start Python (`python`) and run:
 
 ```python
 import duckdb
+
 con = duckdb.connect("data/processed/teknic_mumbai/engine.duckdb", read_only=True)
-rows = con.execute("select scope_value, round(value,1) from backtest_metrics "
-                   "where scope_type='series' and metric='mae' "
-                   "and model='lightgbm_global' order by value desc limit 10").fetchall()
-for series, mae in rows: print(series, mae)
+rows = con.execute(
+    "select scope_value, round(value,1) from backtest_metrics "
+    "where scope_type='series' and metric='mae' "
+    "and model='lightgbm_global' order by value desc limit 10"
+).fetchall()
+for series, mae in rows:
+    print(series, mae)
 ```
 
 Expect ten series ids, worst first, with `S0258` around 54,580 at the top —
@@ -372,7 +415,8 @@ Then re-run steps 1–3. Total: about 42 seconds.
 | `engine clients` | List configured client profiles | — |
 | `engine ingest` | Load a source file into the canonical store | `--client`, `--file` |
 | `engine features` | Profile series and classify demand patterns | `--client` |
-| `engine backtest` | Rolling-origin evaluation, persists scoreboard | `--client`, `--horizon`, `--origins` |
+| `engine backtest` | Rolling-origin evaluation, persists scoreboard | `--client`, `--horizon`, `--origins`, `--max-history` |
+| `engine coldstart` | Accuracy vs. length of training history | `--client`, `--depths` |
 | `engine report` | Re-render a stored run | `--client`, `--run-id` |
 | `engine forecast` | Forecast forward from end of history | `--client`, `--horizon`, `--model` |
 
@@ -398,7 +442,8 @@ The file holds what the engine **cannot infer**:
 | `hierarchy` | Which columns identify a series, and which group it |
 | `evaluation` | Horizon, origin count, minimum training window |
 | `patterns` | Thresholds for the demand-pattern classifier |
-| `models` | Which forecasters run, which is the baseline, arbitration margin |
+| `segments` | Cumulative volume-share boundaries for Head / Mid / Tail |
+| `models` | Which forecasters run, the baseline, arbitration, and per-model settings |
 
 It deliberately does **not** hold a demand-pattern setting. Patterns vary series
 by series *within* a single client — this dataset has one customer with series
@@ -430,6 +475,7 @@ registry entry — nothing else in the pipeline changes.
 ```python
 # src/engine/forecast/my_model.py
 from engine.forecast.base import ForecastContext, Forecaster, register_forecaster
+
 
 @register_forecaster
 class MyForecaster(Forecaster):
@@ -483,13 +529,25 @@ tests/                   42 tests
 | `auto_ets` | Automatic exponential smoothing, per series |
 | `croston` | Intermittent demand |
 | `lightgbm_global` | One pooled model across all series, horizon as a feature |
+| `chronos2` | Amazon Chronos-2 (120M, Apache-2.0), pretrained and run zero-shot |
 | `auto_arima` | Registered, disabled by default |
 
-Arbitration picks a model per series, **shrunk toward the best overall model**:
-a challenger must beat the champion by `models.arbitration.min_improvement_pct`
-on that series before it is selected. Without that margin, per-series selection
-fits noise and scores *worse* out-of-sample than using the champion everywhere —
-measured at 794 vs 692 MAE before the margin was introduced.
+Arbitration picks a model per series in two stages.
+
+**A default per stratum.** Each volume segment gets its own champion, scored on
+median series WAPE — the model that is best for a *typical* series in that
+segment. A single global default cannot work once the portfolio holds models with
+complementary strengths: measured on this data, defaulting everything to the
+narrow global winner cost 660.1 MAE versus 631.5 for per-segment defaults.
+
+**A per-series override with a margin.** A challenger must beat its segment's
+champion by `models.arbitration.min_improvement_pct` on that series before it is
+selected. Without the margin, per-series selection fits noise and scores *worse*
+out-of-sample than using the champion everywhere — 794 vs 692 MAE when measured.
+
+Both stages exist because they were measured, not assumed. Blending was tested
+and rejected: an equal-weight mean of the two strongest models scored 684.7 MAE,
+worse than selection at 631.5.
 
 ### How accuracy is measured
 
@@ -552,9 +610,68 @@ Stated plainly, so nothing here is mistaken for more than it is.
 - **No exogenous signals, no uncertainty intervals, no decisions.** Forecasts are
   point estimates in units. Weather, festival calendars, conformal intervals, and
   ordering recommendations arrive in later phases by design.
-- **Intermittent series remain hard.** That slice is where foundation models are
-  most likely to add value next.
+- **Intermittent series remain hard.** A median series WAPE near 1.0 on that
+  slice reflects the genuine difficulty of mostly-zero demand.
+- **No exogenous signals, no uncertainty intervals, no decisions yet.** Chronos-2
+  produces quantiles and accepts covariates natively, but neither is used yet —
+  those are Phase 2.
 
-Phase 1 adds Chronos-2 and TimesFM for cold-start and long-tail series,
-arbitrated against these baselines by the same scoreboard — with this run as the
-number they have to beat.
+---
+
+## 13. What Phase 1 measured
+
+Phase 1's premise was that a pretrained foundation model earns its place on
+cold-start and long-tail series while a tuned pooled model keeps winning on
+high-volume ones. That is testable, so it was tested rather than assumed.
+
+### Chronos-2 does not win overall
+
+On the held-out origin, Chronos-2 (694.2 MAE) and LightGBM (691.7) are within
+0.4% of each other — statistically indistinguishable. Adding a foundation model
+did **not** move the headline number: the portfolio went from 629.4 MAE in Phase
+0 to 631.5 in Phase 1. What did improve is median series WAPE, 0.127 → 0.120,
+because the gain lands on many small series rather than the few large ones that
+dominate a volume-weighted total.
+
+### It wins exactly where the research predicted
+
+Forecast Value Add by volume segment (median series WAPE, vs seasonal-naive):
+
+| Model | Head | Mid | Tail |
+| --- | --- | --- | --- |
+| `lightgbm_global` | −15.0% | +38.7% | +30.7% |
+| `chronos2` | −29.2% | +36.6% | **+33.8%** |
+
+Chronos-2 wins the long tail and loses the head. That is the split the
+arbitration now encodes: `Head -> lightgbm_global`, `Tail -> chronos2`.
+
+### The cold-start crossover is at roughly two years
+
+`engine coldstart` truncates every series' history and re-runs the backtest.
+Median series WAPE, lower is better:
+
+| History | 3 periods | 6 | 12 | 24 | 36 |
+| --- | --- | --- | --- | --- | --- |
+| `chronos2` | **0.188** | **0.199** | **0.183** | 0.147 | 0.133 |
+| `lightgbm_global` | 0.222 | 0.215 | 0.200 | **0.144** | 0.137 |
+| `auto_ets` | 1.000 | 1.000 | 0.184 | 0.183 | 0.149 |
+
+Below about 24 periods the pretrained model wins; above it the pooled learner
+takes over. `auto_ets` cannot fit a seasonal model on 3–6 observations at all.
+This is the clearest evidence for keeping a foundation model in the portfolio:
+not because it is better in general, but because it degrades gracefully when
+there is nothing to learn from.
+
+### Caveat on these numbers
+
+The per-segment champion metric was chosen *after* seeing held-out results,
+which makes 631.5 mildly optimistic — the holdout informed a design decision, so
+it is no longer a fully untouched test set. The reasoning behind the choice is
+independent of the score (a default should represent the typical series in its
+segment, not the segment's largest), and the same scale-domination lesson was
+already established in Phase 0. But the honest reading is that Phase 1 leaves
+overall accuracy flat and improves the long tail — not that it lifted the
+headline number.
+
+Phase 2 adds the exogenous context layer (weather, festival calendars) and
+conformal prediction intervals, with this run as the number to beat.

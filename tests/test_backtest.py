@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from engine.evaluate.backtest import BacktestError, build_plan
+from engine.evaluate.backtest import BacktestError, build_plan, truncate_history
 from engine.evaluate.backtest import run as run_backtest
 from tests.conftest import monthly_series
 
@@ -32,6 +32,19 @@ def test_plan_respects_the_minimum_training_window(client):
     history = monthly_series("S1", [1.0] * 36)
     with pytest.raises(BacktestError, match="below the configured minimum"):
         build_plan(history, profile)
+
+
+def test_truncation_keeps_the_most_recent_history(history):
+    """Cold start is simulated by taking history away, not by dropping series."""
+    truncated = truncate_history(history, 4)
+
+    assert truncated.height == 2 * 4  # two series, four periods each
+    assert truncated["period"].max() == history["period"].max()
+    assert truncated["period"].min() > history["period"].min()
+
+
+def test_truncation_beyond_available_history_is_a_no_op(history):
+    assert truncate_history(history, 999).height == history.height
 
 
 def test_backtest_never_trains_on_the_period_it_forecasts(client, history, series_meta):

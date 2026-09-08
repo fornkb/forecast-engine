@@ -63,13 +63,29 @@ def build_plan(history: pl.DataFrame, client: ClientProfile) -> BacktestPlan:
     return BacktestPlan(cutoffs=[periods[i] for i in indices], horizon=config.horizon)
 
 
+def truncate_history(history: pl.DataFrame, max_periods: int) -> pl.DataFrame:
+    """Keep only each series' most recent `max_periods` observations.
+
+    Used to simulate cold start: this panel has no genuinely new products, so the
+    only honest way to test whether a model earns its place on short history is
+    to take history away and watch what happens to the ranking.
+    """
+    return history.filter(
+        pl.col("period").rank("ordinal", descending=True).over("series_id") <= max_periods
+    )
+
+
 def run(
     history: pl.DataFrame,
     series_meta: pl.DataFrame,
     client: ClientProfile,
     plan: BacktestPlan,
+    max_history: int | None = None,
 ) -> pl.DataFrame:
     """Forecast every enabled model at every origin and attach actuals.
+
+    `max_history` truncates each series' training window to that many periods,
+    leaving the evaluation periods untouched.
 
     Returns columns: model, origin, cutoff_period, series_id, period, horizon,
     actual, forecast.
@@ -80,6 +96,8 @@ def run(
 
     for origin_index, cutoff in enumerate(plan.cutoffs, start=1):
         train = history.filter(pl.col("period") <= cutoff)
+        if max_history is not None:
+            train = truncate_history(train, max_history)
         console.print(
             f"   [dim]origin {origin_index}/{plan.n_origins} — "
             f"train through {cutoff}, {train.height} rows[/dim]"

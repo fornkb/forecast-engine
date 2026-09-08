@@ -97,6 +97,7 @@ def test_store_round_trips_profiles(tmp_path):
             "n_zeros": [0],
             "zero_fraction": [0.0],
             "mean_demand": [10.0],
+            "total_volume": [360.0],
             "cv": [0.1],
             "adi": [1.0],
             "cv2": [0.01],
@@ -105,6 +106,7 @@ def test_store_round_trips_profiles(tmp_path):
             "residual_cv": [0.05],
             "slope": [0.0],
             "pattern": ["Stable"],
+            "volume_segment": ["Head"],
         }
     )
     store.write_series_profiles(profiles)

@@ -5,7 +5,12 @@ from datetime import date
 import polars as pl
 import pytest
 
-from engine.forecast.arbitration import apply_selection, pick_champion, select_per_series
+from engine.forecast.arbitration import (
+    GLOBAL_STRATUM,
+    apply_selection,
+    pick_champions,
+    select_per_series,
+)
 from engine.forecast.base import (
     ForecastContext,
     available_forecasters,
@@ -86,7 +91,9 @@ def _scores() -> pl.DataFrame:
 def test_arbitration_keeps_champion_without_a_clear_margin():
     """Per-series selection on few observations is mostly noise, so a challenger
     must win by a margin before it displaces the champion."""
-    selection = select_per_series(_scores(), "mae", champion="champ", min_improvement=0.15)
+    selection = select_per_series(
+        _scores(), "mae", champions={GLOBAL_STRATUM: "champ"}, min_improvement=0.15
+    )
     chosen = dict(zip(selection["series_id"], selection["model"], strict=True))
 
     assert chosen["S1"] == "champ"  # 5% better is not enough
@@ -94,13 +101,46 @@ def test_arbitration_keeps_champion_without_a_clear_margin():
 
 
 def test_arbitration_without_margin_takes_the_best_score():
-    selection = select_per_series(_scores(), "mae", champion="champ", min_improvement=0.0)
+    selection = select_per_series(
+        _scores(), "mae", champions={GLOBAL_STRATUM: "champ"}, min_improvement=0.0
+    )
     assert set(selection["model"].to_list()) == {"challenger"}
 
 
-def test_pick_champion_takes_the_lowest_overall_error():
-    overall = pl.DataFrame({"model": ["a", "b"], "mae": [12.0, 7.0]})
-    assert pick_champion(overall, "mae") == "b"
+def test_pick_champions_takes_the_lowest_error_in_each_stratum():
+    scores = pl.DataFrame(
+        {
+            "stratum": ["Head", "Head", "Tail", "Tail"],
+            "model": ["a", "b", "a", "b"],
+            "score": [12.0, 7.0, 3.0, 9.0],
+        }
+    )
+    assert pick_champions(scores, "score") == {"Head": "b", "Tail": "a"}
+
+
+def test_each_stratum_defaults_to_its_own_champion():
+    """A single global default is wrong for one group or another once models have
+    complementary strengths across volume segments."""
+    scores = pl.DataFrame(
+        {
+            "series_id": ["big", "small"],
+            "model": ["pooled", "foundation"],
+            "score": [10.0, 10.0],
+        }
+    )
+    strata = pl.DataFrame({"series_id": ["big", "small"], "stratum": ["Head", "Tail"]})
+
+    selection = select_per_series(
+        scores,
+        "mae",
+        champions={"Head": "pooled", "Tail": "foundation"},
+        strata=strata,
+        min_improvement=0.15,
+    )
+    chosen = dict(zip(selection["series_id"], selection["model"], strict=True))
+
+    assert chosen["big"] == "pooled"
+    assert chosen["small"] == "foundation"
 
 
 def test_apply_selection_keeps_one_model_per_series():

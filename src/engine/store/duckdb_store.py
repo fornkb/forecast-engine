@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS series_profile (
     n_zeros           BIGINT,
     zero_fraction     DOUBLE,
     mean_demand       DOUBLE,
+    total_volume      DOUBLE,
     cv                DOUBLE,
     adi               DOUBLE,
     cv2               DOUBLE,
@@ -59,6 +60,7 @@ CREATE TABLE IF NOT EXISTS series_profile (
     residual_cv       DOUBLE,
     slope             DOUBLE,
     pattern           VARCHAR,
+    volume_segment    VARCHAR,
     computed_at       TIMESTAMP NOT NULL
 );
 
@@ -120,6 +122,14 @@ CREATE TABLE IF NOT EXISTS pattern_validation (
 """
 
 
+# Applied on every open. `IF NOT EXISTS` makes each one idempotent, so a store
+# created by an earlier version gains new columns instead of needing a rebuild.
+MIGRATIONS = (
+    "ALTER TABLE series_profile ADD COLUMN IF NOT EXISTS total_volume DOUBLE",
+    "ALTER TABLE series_profile ADD COLUMN IF NOT EXISTS volume_segment VARCHAR",
+)
+
+
 class EngineStore:
     """Thin, explicit persistence layer. All SQL lives here."""
 
@@ -141,6 +151,8 @@ class EngineStore:
     def init_schema(self) -> None:
         with self.connect() as con:
             con.execute(DDL)
+            for statement in MIGRATIONS:
+                con.execute(statement)
 
     # ------------------------------------------------------------------ ingest
 
@@ -167,8 +179,8 @@ class EngineStore:
                     "DELETE FROM fact_demand WHERE client_id = ? AND source_file = ?",
                     [self.client_id, source_file],
                 )
-            con.execute("INSERT INTO dim_series SELECT * FROM incoming_dim")
-            con.execute("INSERT INTO fact_demand SELECT * FROM incoming_fact")
+            con.execute("INSERT INTO dim_series BY NAME SELECT * FROM incoming_dim")
+            con.execute("INSERT INTO fact_demand BY NAME SELECT * FROM incoming_fact")
             con.execute("COMMIT")
 
         self._export_parquet(dim, fact)
@@ -217,6 +229,7 @@ class EngineStore:
             "n_zeros",
             "zero_fraction",
             "mean_demand",
+            "total_volume",
             "cv",
             "adi",
             "cv2",
@@ -225,12 +238,13 @@ class EngineStore:
             "residual_cv",
             "slope",
             "pattern",
+            "volume_segment",
             "computed_at",
         )
         with self.connect() as con:
             con.register("incoming_profiles", frame)
             con.execute("DELETE FROM series_profile WHERE client_id = ?", [self.client_id])
-            con.execute("INSERT INTO series_profile SELECT * FROM incoming_profiles")
+            con.execute("INSERT INTO series_profile BY NAME SELECT * FROM incoming_profiles")
 
     def load_series_profiles(self) -> pl.DataFrame:
         with self.connect() as con:
@@ -289,7 +303,7 @@ class EngineStore:
         )
         with self.connect() as con:
             con.register("incoming_preds", frame)
-            con.execute("INSERT INTO backtest_predictions SELECT * FROM incoming_preds")
+            con.execute("INSERT INTO backtest_predictions BY NAME SELECT * FROM incoming_preds")
 
     def load_backtest_predictions(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:
@@ -301,7 +315,7 @@ class EngineStore:
         )
         with self.connect() as con:
             con.register("incoming_metrics", frame)
-            con.execute("INSERT INTO backtest_metrics SELECT * FROM incoming_metrics")
+            con.execute("INSERT INTO backtest_metrics BY NAME SELECT * FROM incoming_metrics")
 
     def load_metrics(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:
@@ -313,7 +327,7 @@ class EngineStore:
         )
         with self.connect() as con:
             con.register("incoming_selection", frame)
-            con.execute("INSERT INTO model_selection SELECT * FROM incoming_selection")
+            con.execute("INSERT INTO model_selection BY NAME SELECT * FROM incoming_selection")
 
     def load_model_selection(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:
@@ -325,7 +339,7 @@ class EngineStore:
         )
         with self.connect() as con:
             con.register("incoming_pattern_val", frame)
-            con.execute("INSERT INTO pattern_validation SELECT * FROM incoming_pattern_val")
+            con.execute("INSERT INTO pattern_validation BY NAME SELECT * FROM incoming_pattern_val")
 
     def load_pattern_validation(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:
@@ -349,7 +363,7 @@ class EngineStore:
         )
         with self.connect() as con:
             con.register("incoming_forecasts", frame)
-            con.execute("INSERT INTO forecasts SELECT * FROM incoming_forecasts")
+            con.execute("INSERT INTO forecasts BY NAME SELECT * FROM incoming_forecasts")
 
     def load_forecasts(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:

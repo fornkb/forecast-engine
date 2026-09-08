@@ -23,6 +23,7 @@ from engine.features.pattern import (
     profile_series,
     validate_against_labels,
 )
+from engine.features.segments import assign_volume_segments, segment_summary
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, get_forecaster
 from engine.ingest import get_reader
@@ -111,12 +112,22 @@ def features(client: ClientOption) -> None:
 
     with log_step(f"Profiling {fact['series_id'].n_unique()} series"):
         profiles = profile_series(fact, profile.patterns, profile.calendar.seasonal_period)
+        profiles = assign_volume_segments(
+            profiles, profile.segments.head_share, profile.segments.mid_share
+        )
         store.write_series_profiles(profiles)
 
     counts = profiles.group_by("pattern").len().sort("len", descending=True)
     console.print(
         "   detected patterns: "
         + ", ".join(f"{row['pattern']} {row['len']}" for row in counts.iter_rows(named=True))
+    )
+    console.print(
+        "   volume segments: "
+        + ", ".join(
+            f"{row['volume_segment']} {row['series']} series / {row['volume_pct']}% of volume"
+            for row in segment_summary(profiles).iter_rows(named=True)
+        )
     )
 
     matrix = validate_against_labels(profiles, dim)
@@ -137,6 +148,10 @@ def backtest(
     horizon: Annotated[int | None, typer.Option(help="Override the configured horizon.")] = None,
     origins: Annotated[
         int | None, typer.Option(help="Override the configured origin count.")
+    ] = None,
+    max_history: Annotated[
+        int | None,
+        typer.Option(help="Truncate each series to this many periods of history."),
     ] = None,
 ) -> None:
     """Run the rolling-origin backtest and persist the scoreboard."""
@@ -165,7 +180,7 @@ def backtest(
     )
 
     with log_step("Backtesting"):
-        predictions = backtest_module.run(fact, dim, profile, plan)
+        predictions = backtest_module.run(fact, dim, profile, plan, max_history=max_history)
 
     with log_step("Scoring"):
         result = scoreboard.compute(predictions, profiles, profile)
@@ -177,13 +192,57 @@ def backtest(
                 "cutoffs": [str(c) for c in plan.cutoffs],
                 "models": profile.models.enabled,
                 "baseline": profile.models.baseline,
+                "champions": result.champions,
             },
         )
         store.write_backtest_predictions(run_id, predictions)
         scoreboard.persist(store, run_id, result)
 
+    console.print(
+        "   default model per "
+        + f"{profile.models.arbitration.stratify_by}: "
+        + ", ".join(f"{k} -> {v}" for k, v in sorted(result.champions.items()))
+    )
     console.print(f"   [dim]run {run_id} persisted[/dim]\n")
     _render_run(store, run_id, profile)
+
+
+@app.command()
+def coldstart(
+    client: ClientOption,
+    depths: Annotated[
+        str, typer.Option(help="Comma-separated history lengths to test.")
+    ] = "3,6,12,24,36",
+) -> None:
+    """Measure how each model's accuracy holds up as history is taken away.
+
+    This panel contains no genuinely new products, so cold start is simulated by
+    truncating each series' training window and re-running the same backtest.
+    """
+    profile, store = _load(client)
+    fact, dim = _require_data(store)
+    profiles = _ensure_profiles(store, profile, fact)
+
+    try:
+        depth_list = sorted({int(d) for d in depths.split(",") if d.strip()})
+    except ValueError as exc:
+        console.print(f"[red]Could not parse --depths {depths!r}: expected integers[/red]")
+        raise typer.Exit(code=1) from exc
+
+    plan = backtest_module.build_plan(fact, profile)
+    rows: list[dict[str, object]] = []
+
+    for depth in depth_list:
+        with log_step(f"Backtesting with {depth} periods of history"):
+            predictions = backtest_module.run(fact, dim, profile, plan, max_history=depth)
+        result = scoreboard.compute(predictions, profiles, profile)
+        overall = result.metrics_long.filter(
+            (pl.col("scope_type") == "overall") & (pl.col("metric") == "median_series_wape")
+        )
+        for row in overall.iter_rows(named=True):
+            rows.append({"depth": depth, "model": row["model"], "score": row["value"]})
+
+    scoreboard.render_cold_start(pl.DataFrame(rows), profile.models.baseline)
 
 
 @app.command()
@@ -213,16 +272,24 @@ def _render_run(store: EngineStore, run_id: int, profile: ClientProfile) -> None
         f"[bold]Run {run_id}[/bold] · {profile.display_name} · "
         f"[dim]{info['created_at'] if info else ''}[/dim]"
     )
-    scoreboard.render_accuracy(metrics, profile.models.baseline)
-    scoreboard.render_pattern_slices(
-        metrics, profile.models.baseline, "fva_mae_pct", "MAE, volume-weighted"
-    )
-    scoreboard.render_pattern_slices(
-        metrics, profile.models.baseline, "fva_median_wape_pct", "median series WAPE"
+    baseline = profile.models.baseline
+    scoreboard.render_accuracy(metrics, baseline)
+    scoreboard.render_slices(metrics, baseline, "fva_mae_pct", "MAE, volume-weighted")
+    scoreboard.render_slices(metrics, baseline, "fva_median_wape_pct", "median series WAPE")
+    scoreboard.render_slices(
+        metrics,
+        baseline,
+        "fva_median_wape_pct",
+        "median series WAPE",
+        scope_type="segment",
+        dimension="volume segment",
     )
     holdout_in_sample = metrics.filter(pl.col("scope_type") == "holdout").is_empty()
-    scoreboard.render_holdout(metrics, profile.models.baseline, holdout_in_sample)
-    scoreboard.render_portfolio_by_pattern(metrics, profile.models.baseline)
+    scoreboard.render_holdout(metrics, baseline, holdout_in_sample)
+    scoreboard.render_portfolio_by_scope(metrics, baseline)
+    scoreboard.render_portfolio_by_scope(
+        metrics, baseline, scope_type="holdout_segment", dimension="volume segment"
+    )
     if not selection.is_empty():
         scoreboard.render_selection(selection)
 

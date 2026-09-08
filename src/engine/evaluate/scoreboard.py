@@ -18,7 +18,12 @@ from engine.evaluate.metrics import (
     aggregate_series_level,
     to_long,
 )
-from engine.forecast.arbitration import pick_champion, select_per_series, selection_summary
+from engine.forecast.arbitration import (
+    GLOBAL_STRATUM,
+    pick_champions,
+    select_per_series,
+    selection_summary,
+)
 from engine.store import EngineStore
 from engine.utils.console import console
 
@@ -29,7 +34,7 @@ PORTFOLIO_MODEL = "portfolio"
 class ScoreboardResult:
     metrics_long: pl.DataFrame
     selection: pl.DataFrame
-    champion: str
+    champions: dict[str, str]
     holdout_origin: int
     selection_is_in_sample: bool
 
@@ -45,13 +50,41 @@ def _scope(
     return to_long(wide, scope_type, scope_column)
 
 
+def _champion_scores(
+    predictions: pl.DataFrame, stratum_column: str | None, champion_metric: str
+) -> pl.DataFrame:
+    """Score each model within each stratum, for picking that stratum's default."""
+    group_by = ["model"] + ([stratum_column] if stratum_column else [])
+
+    if champion_metric == "median_series_wape":
+        frame = aggregate_series_level(predictions, group_by).rename(
+            {"median_series_wape": "score"}
+        )
+    else:
+        frame = aggregate(predictions, group_by).select(
+            *group_by, pl.col(champion_metric).alias("score")
+        )
+
+    if stratum_column:
+        return frame.rename({stratum_column: "stratum"})
+    return frame.with_columns(pl.lit(GLOBAL_STRATUM).alias("stratum"))
+
+
 def compute(
     predictions: pl.DataFrame, profiles: pl.DataFrame, client: ClientProfile
 ) -> ScoreboardResult:
     baseline = client.models.baseline
+    profile_columns = ["series_id", "pattern"]
+    if "volume_segment" in profiles.columns:
+        profile_columns.append("volume_segment")
+
     labelled = predictions.join(
-        profiles.select("series_id", "pattern"), on="series_id", how="left"
+        profiles.select(profile_columns), on="series_id", how="left"
     ).with_columns(pl.col("pattern").fill_null("Unclassified"))
+
+    has_segments = "volume_segment" in labelled.columns
+    if has_segments:
+        labelled = labelled.with_columns(pl.col("volume_segment").fill_null("Unsegmented"))
 
     holdout_origin = int(labelled["origin"].max())
     selection_source = labelled.filter(pl.col("origin") < holdout_origin)
@@ -64,11 +97,25 @@ def compute(
     series_scores = aggregate(selection_source, ["model", "series_id"]).select(
         "series_id", "model", pl.col(arbitration.selection_metric).alias("score")
     )
-    champion = pick_champion(aggregate(selection_source, ["model"]), arbitration.selection_metric)
+
+    stratum_column = arbitration.stratify_by
+    if stratum_column == "none" or stratum_column not in selection_source.columns:
+        strata = None
+        stratum_scores = _champion_scores(selection_source, None, arbitration.champion_metric)
+    else:
+        strata = labelled.select("series_id", pl.col(stratum_column).alias("stratum")).unique(
+            subset=["series_id"]
+        )
+        stratum_scores = _champion_scores(
+            selection_source, stratum_column, arbitration.champion_metric
+        )
+
+    champions = pick_champions(stratum_scores, "score")
     selection = select_per_series(
         series_scores,
         arbitration.selection_metric,
-        champion=champion,
+        champions=champions,
+        strata=strata,
         min_improvement=arbitration.min_improvement_pct / 100,
     )
 
@@ -78,21 +125,26 @@ def compute(
     ).with_columns(pl.lit(PORTFOLIO_MODEL).alias("model"))
     holdout_with_portfolio = pl.concat([holdout, portfolio])
 
-    metrics_long = pl.concat(
-        [
-            _scope(labelled, "overall", None, baseline),
-            _scope(labelled, "pattern", "pattern", baseline),
-            _scope(labelled, "horizon", "horizon", baseline),
-            _scope(labelled, "series", "series_id", baseline),
-            _scope(holdout_with_portfolio, "holdout", None, baseline),
-            _scope(holdout_with_portfolio, "holdout_pattern", "pattern", baseline),
+    scopes = [
+        _scope(labelled, "overall", None, baseline),
+        _scope(labelled, "pattern", "pattern", baseline),
+        _scope(labelled, "horizon", "horizon", baseline),
+        _scope(labelled, "series", "series_id", baseline),
+        _scope(holdout_with_portfolio, "holdout", None, baseline),
+        _scope(holdout_with_portfolio, "holdout_pattern", "pattern", baseline),
+    ]
+    if has_segments:
+        scopes += [
+            _scope(labelled, "segment", "volume_segment", baseline),
+            _scope(holdout_with_portfolio, "holdout_segment", "volume_segment", baseline),
         ]
-    )
+
+    metrics_long = pl.concat(scopes)
 
     return ScoreboardResult(
         metrics_long=metrics_long,
         selection=selection,
-        champion=champion,
+        champions=champions,
         holdout_origin=holdout_origin,
         selection_is_in_sample=selection_is_in_sample,
     )
@@ -163,14 +215,21 @@ def render_accuracy(metrics: pl.DataFrame, baseline: str) -> None:
     )
 
 
-def render_pattern_slices(metrics: pl.DataFrame, baseline: str, metric: str, label: str) -> None:
-    pivot = _pivot_scope(metrics, "pattern", metric)
+def render_slices(
+    metrics: pl.DataFrame,
+    baseline: str,
+    metric: str,
+    label: str,
+    scope_type: str = "pattern",
+    dimension: str = "demand pattern",
+) -> None:
+    pivot = _pivot_scope(metrics, scope_type, metric)
     if pivot.is_empty():
         return
 
     scopes = [c for c in pivot.columns if c != "model"]
     table = Table(
-        title=f"Forecast Value Add by demand pattern (vs {baseline}, {label})",
+        title=f"Forecast Value Add by {dimension} (vs {baseline}, {label})",
         title_justify="left",
         header_style="bold",
     )
@@ -222,14 +281,19 @@ def render_holdout(metrics: pl.DataFrame, baseline: str, in_sample: bool) -> Non
     console.print(table)
 
 
-def render_portfolio_by_pattern(metrics: pl.DataFrame, baseline: str) -> None:
-    """The arbitrated portfolio's per-pattern result on the held-out origin.
+def render_portfolio_by_scope(
+    metrics: pl.DataFrame,
+    baseline: str,
+    scope_type: str = "holdout_pattern",
+    dimension: str = "pattern",
+) -> None:
+    """The arbitrated portfolio's per-slice result on the held-out origin.
 
-    This is the view the Phase 0 gate is judged on: the portfolio must not lose
-    to the baseline on any demand pattern.
+    This is the view the phase gate is judged on: the portfolio must not lose to
+    the baseline on any slice.
     """
     slices = metrics.filter(
-        (pl.col("scope_type") == "holdout_pattern") & (pl.col("model") == PORTFOLIO_MODEL)
+        (pl.col("scope_type") == scope_type) & (pl.col("model") == PORTFOLIO_MODEL)
     )
     if slices.is_empty():
         return
@@ -239,11 +303,11 @@ def render_portfolio_by_pattern(metrics: pl.DataFrame, baseline: str) -> None:
     )
 
     table = Table(
-        title=f"Portfolio vs {baseline} by pattern — held-out origin",
+        title=f"Portfolio vs {baseline} by {dimension} — held-out origin",
         title_justify="left",
         header_style="bold",
     )
-    table.add_column("Pattern")
+    table.add_column(dimension.capitalize())
     table.add_column("MAE", justify="right")
     table.add_column("FVA (MAE)", justify="right")
     table.add_column("Median series WAPE", justify="right")
@@ -257,6 +321,56 @@ def render_portfolio_by_pattern(metrics: pl.DataFrame, baseline: str) -> None:
             _fmt(row.get("median_series_wape"), 3),
             _fva_cell(row.get("fva_median_wape_pct")),
         )
+    console.print(table)
+
+
+def render_cold_start(rows: pl.DataFrame, baseline: str) -> None:
+    """Median series WAPE per model as training history is shortened.
+
+    Reading down a column shows which model degrades most gracefully as history
+    runs out — the property that decides whether a pretrained model earns its
+    place on new products.
+    """
+    pivot = (
+        rows.with_columns(pl.col("depth").cast(pl.Utf8))
+        .pivot(values="score", index="model", on="depth")
+        .sort("model")
+    )
+    depths = sorted((c for c in pivot.columns if c != "model"), key=int)
+
+    table = Table(
+        title="Median series WAPE by length of training history (lower is better)",
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("Model")
+    for depth in depths:
+        table.add_column(f"{depth} periods", justify="right")
+
+    # Highlight the best model at each history length.
+    best = {
+        depth: min(
+            (r for r in pivot.iter_rows(named=True) if r.get(depth) is not None),
+            key=lambda r, d=depth: r[d],
+            default=None,
+        )
+        for depth in depths
+    }
+
+    for row in pivot.iter_rows(named=True):
+        cells = []
+        for depth in depths:
+            value = row.get(depth)
+            if value is None:
+                cells.append("[dim]-[/dim]")
+            elif best[depth] and best[depth]["model"] == row["model"]:
+                cells.append(f"[green]{value:.3f}[/green]")
+            else:
+                cells.append(f"{value:.3f}")
+        label = (
+            f"{row['model']}  [dim](baseline)[/dim]" if row["model"] == baseline else row["model"]
+        )
+        table.add_row(label, *cells)
     console.print(table)
 
 

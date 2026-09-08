@@ -40,6 +40,10 @@ patterns:
   trend_strength: 0.60
   volatility_cv: 0.15
 
+segments: # cumulative volume-share boundaries for Head / Mid / Tail
+  head_share: 0.80
+  mid_share: 0.95
+
 models:
   enabled:
     - seasonal_naive
@@ -47,7 +51,13 @@ models:
     - auto_ets
     - croston
     - lightgbm_global
+    - chronos2
   baseline: seasonal_naive # Forecast Value Add reference
+  arbitration:
+    selection_metric: mae
+    min_improvement_pct: 15.0
+    stratify_by: volume_segment # default model is chosen per segment, not globally
+    champion_metric: median_series_wape # the typical series in the segment, not its biggest
   static_features: # categorical attributes the pooled model may learn from
     - customer
     - item_group
@@ -58,6 +68,11 @@ models:
     num_leaves: 31
     min_data_in_leaf: 20
     num_boost_round: 400
+  chronos: # zero-shot foundation model — pretrained, never fitted here
+    model_id: amazon/chronos-2
+    device: cpu
+    quantile_levels: [0.1, 0.5, 0.9]
+    batch_size: 64
 
 # Populated in Phase 2 (context layer) and the decision layer — present now so
 # those phases extend this file instead of replacing it.
