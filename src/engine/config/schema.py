@@ -40,7 +40,9 @@ class ColumnMap(StrictModel):
 
 
 class SourceConfig(StrictModel):
-    reader: Literal["excel_demand"] = "excel_demand"
+    # Must match a name registered in engine.ingest; kept as a literal so a typo
+    # fails at config load rather than at the end of an ingest.
+    reader: Literal["excel_demand", "parquet_panel", "csv_panel"] = "excel_demand"
     sheet: str | None = None
     column_map: ColumnMap = Field(default_factory=ColumnMap)
 
@@ -119,6 +121,10 @@ class ChronosParams(StrictModel):
 
 
 class LightGBMParams(StrictModel):
+    # Generate training rows from only the most recent N periods of each series.
+    # Bounds memory on large panels, and recent history is usually the more
+    # relevant signal anyway. None uses everything available.
+    max_training_periods: int | None = Field(default=None, ge=2)
     objective: str = "l1"
     learning_rate: float = 0.05
     num_leaves: int = 31

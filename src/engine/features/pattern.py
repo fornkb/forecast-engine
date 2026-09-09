@@ -125,10 +125,22 @@ def profile_series(
         nonzero_mean = float(np.mean(nonzero)) if len(nonzero) else 0.0
         cv2 = float((np.std(nonzero) / nonzero_mean) ** 2) if nonzero_mean > 0 else 0.0
 
-        trend_strength, seasonal_strength, residual_cv = _decompose(values, seasonal_period)
+        zero_fraction = n_zeros / n if n else 1.0
+        is_intermittent = (
+            zero_fraction >= thresholds.zero_fraction_intermittent
+            or adi >= thresholds.adi_intermittent
+        )
+
+        # Decomposition is skipped for intermittent series: their trend and
+        # seasonality scores are meaningless (which is why classification checks
+        # intermittency first), and STL is by far the most expensive step here.
+        if is_intermittent:
+            trend_strength = seasonal_strength = residual_cv = 0.0
+        else:
+            trend_strength, seasonal_strength, residual_cv = _decompose(values, seasonal_period)
 
         stats = {
-            "zero_fraction": n_zeros / n if n else 1.0,
+            "zero_fraction": zero_fraction,
             "adi": adi,
             "cv2": cv2,
             "trend_strength": trend_strength,

@@ -1,0 +1,84 @@
+client_id: m5_walmart
+display_name: "M5 — Walmart California (weekly)"
+currency: USD
+
+# Prepared by scripts/prepare_m5.py, which aggregates the daily M5 panel to
+# weekly and writes it in canonical long format — so the column map is identity.
+source:
+  reader: parquet_panel
+  sheet: null
+  column_map:
+    series_id: series_id
+    customer: customer # store_id
+    item_code: item_code
+    description: description
+    item_group: item_group # dept_id
+    period: period
+    quantity: quantity
+    uom: uom
+    source_sheet: source_sheet # cat_id
+    ground_truth_pattern: null # real data carries no pattern labels
+
+calendar:
+  granularity: weekly
+  fiscal_year_start_month: 2 # Walmart's fiscal year starts in February
+
+hierarchy:
+  series_key: [customer, item_code]
+  grouping_keys:
+    - item_group
+    - source_sheet
+
+evaluation:
+  horizon: 4 # four weeks, matching a typical replenishment cycle
+  origins: 3
+  origin_step: 1
+  min_train_periods: 104 # two years, so a 52-week cycle is seen twice
+
+patterns:
+  zero_fraction_intermittent: 0.30
+  adi_intermittent: 1.32
+  seasonal_strength: 0.88
+  trend_strength: 0.60
+  volatility_cv: 0.15
+
+segments:
+  head_share: 0.80
+  mid_share: 0.95
+
+models:
+  enabled:
+    - seasonal_naive
+    - naive
+    - croston
+    - lightgbm_global
+    - chronos2
+  baseline: seasonal_naive
+  arbitration:
+    selection_metric: mae
+    min_improvement_pct: 15.0
+    stratify_by: volume_segment
+    champion_metric: median_series_wape
+  static_features:
+    - customer
+    - item_group
+    - source_sheet
+  lightgbm:
+    # 12k series x 281 weeks x 4 horizons would be ~13M training rows; two years
+    # of origins keeps that bounded without losing the recent signal.
+    max_training_periods: 104
+    objective: l1
+    learning_rate: 0.05
+    num_leaves: 63
+    min_data_in_leaf: 50
+    num_boost_round: 400
+  chronos:
+    model_id: amazon/chronos-2
+    device: cpu
+    quantile_levels: [0.1, 0.5, 0.9]
+    batch_size: 64
+
+# Available in data/raw/m5_walmart_exogenous.parquet — prices, SNAP days, and
+# event calendars, for the context layer in a later phase.
+exogenous_signals: []
+cost_model: null

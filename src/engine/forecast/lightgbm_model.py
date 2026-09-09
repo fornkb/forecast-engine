@@ -45,6 +45,16 @@ class GlobalLightGBMForecaster(Forecaster):
         train = build_training_frame(base, horizon, ctx.granularity).join(
             static, on="series_id", how="left"
         )
+
+        window = ctx.client.models.lightgbm.max_training_periods
+        if window is not None:
+            cutoff = base["period"].max()
+            earliest = (
+                base.filter(pl.col("period") <= cutoff)
+                .select(pl.col("period").unique().sort().tail(window).first())
+                .item()
+            )
+            train = train.filter(pl.col("period") >= earliest)
         if train.is_empty():
             raise ValueError(
                 "No training rows available — history is shorter than the forecast horizon"
@@ -52,6 +62,7 @@ class GlobalLightGBMForecaster(Forecaster):
 
         params = ctx.client.models.lightgbm.model_dump()
         num_boost_round = params.pop("num_boost_round")
+        params.pop("max_training_periods", None)
 
         dataset = lgb.Dataset(
             train.select(features).to_numpy(),

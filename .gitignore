@@ -8,3 +8,8 @@ __pycache__/
 data/processed/
 *.duckdb
 *.duckdb.wal
+
+# Third-party research datasets. Large, and their competition licences do not
+# permit redistribution — regenerate with scripts/prepare_*.py instead.
+data/raw/m5/
+data/raw/m5_walmart*.parquet
