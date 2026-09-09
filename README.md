@@ -6,10 +6,12 @@ ERP-native demand forecasting engine. Terminal-driven, no UI.
 evaluation scoreboard — the bar every later phase has to beat.
 
 **Phase 1** adds Chronos-2, a pretrained time-series foundation model, and the
-machinery to prove where it actually helps: volume segmentation, stratified
-arbitration, and a cold-start experiment. It earns its place on the long tail and
-on short history, not across the board — see
-[What Phase 1 measured](#13-what-phase-1-measured).
+machinery to test where it actually helps: volume segmentation, stratified
+arbitration, and a cold-start experiment. On the synthetic panel it won the long
+tail and short history exactly as the literature predicts. On **real** Walmart
+data it wins neither, and a pooled gradient-boosted model beats it everywhere —
+see [What M5 changed](#14-what-m5-changed). The contrast between those two
+results is the most useful thing this project has produced so far.
 
 There are still **no LLMs and no agents** here. Chronos-2 is a pretrained
 forecasting model, not a language model; the LLM-driven context and explanation
@@ -35,6 +37,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 11. [Troubleshooting](#11-troubleshooting)
 12. [Scope and limits](#12-scope-and-limits)
 13. [What Phase 1 measured](#13-what-phase-1-measured)
+14. [What M5 changed](#14-what-m5-changed)
 
 ---
 
@@ -633,7 +636,15 @@ did **not** move the headline number: the portfolio went from 629.4 MAE in Phase
 because the gain lands on many small series rather than the few large ones that
 dominate a volume-weighted total.
 
-### It wins exactly where the research predicted
+### …and on real data it does not win anywhere
+
+Everything below this line was measured on the **synthetic** panel. Re-running
+the same portfolio on M5 — 12,196 real Walmart item-store series — reversed the
+conclusion. See [What M5 changed](#14-what-m5-changed). The synthetic findings
+are kept here because the contrast between them is the most useful result the
+project has produced.
+
+### On synthetic data it won exactly where the research predicted
 
 Forecast Value Add by volume segment (median series WAPE, vs seasonal-naive):
 
@@ -673,5 +684,102 @@ already established in Phase 0. But the honest reading is that Phase 1 leaves
 overall accuracy flat and improves the long tail — not that it lifted the
 headline number.
 
-Phase 2 adds the exogenous context layer (weather, festival calendars) and
-conformal prediction intervals, with this run as the number to beat.
+---
+
+## 14. What M5 changed
+
+The synthetic conclusions did not survive real data. This section supersedes
+section 13 wherever the two disagree.
+
+### Setup
+
+M5 is Walmart's public competition dataset — 30,490 item-store series, daily,
+with real prices, SNAP benefit days and event calendars. Prepared to weekly
+California: **12,196 series, 2.7M rows, 281 weeks**.
+
+```bash
+python scripts/prepare_m5.py --states CA
+engine ingest   --client m5_walmart --file data/raw/m5_walmart.parquet
+engine features --client m5_walmart
+engine backtest --client m5_walmart
+```
+
+### Real demand looks nothing like the synthetic panel
+
+| | Synthetic | M5 |
+| --- | --- | --- |
+| Volatile + Intermittent | 33% | **88%** |
+| Clean trend / seasonal | 50% | **6%** |
+| Series carrying 80% of volume | 7% | 32% |
+| Median series WAPE achieved | 0.120 | 0.443 |
+
+The generator produced a tidy uniform mix of six archetypes. Real retail is
+overwhelmingly noisy and zero-inflated, and roughly four times harder.
+
+### The portfolio still works
+
+| Model | MAE | WAPE | FVA | Median series WAPE |
+| --- | --- | --- | --- | --- |
+| **portfolio** | **3.9** | **0.362** | **+42.2%** | **0.443** |
+| `lightgbm_global` | 4.2 | 0.385 | +38.5% | 0.460 |
+| `chronos2` | 4.2 | 0.391 | +37.5% | 0.481 |
+| `croston` | 4.4 | 0.409 | +34.6% | 0.491 |
+| `seasonal_naive` | 6.8 | 0.626 | — | 0.676 |
+
+Arbitration beats every individual model, and no pattern or volume slice loses
+to the baseline. That part of Phase 1 holds up.
+
+### The foundation model does not
+
+Forecast Value Add by volume segment (median series WAPE):
+
+| Model | Head | Mid | Tail |
+| --- | --- | --- | --- |
+| `lightgbm_global` | **+39.2%** | **+32.7%** | **+24.0%** |
+| `chronos2` | +37.5% | +29.7% | +19.6% |
+
+On synthetic data Chronos-2 won the tail. On real data it loses the tail, and
+LightGBM wins every segment. Arbitration picks LightGBM for 66.2% of series and
+Chronos-2 for 7.5% — down from 39.4%.
+
+Cold start shows no crossover either. Median series WAPE by training history:
+
+| Model | 8 periods | 26 | 52 | 104 |
+| --- | --- | --- | --- | --- |
+| `lightgbm_global` | **0.462** | **0.458** | **0.458** | **0.460** |
+| `croston` | 0.480 | 0.481 | 0.484 | 0.485 |
+| `chronos2` | 0.509 | 0.491 | 0.484 | 0.484 |
+
+LightGBM wins at every depth, including eight weeks of history.
+
+### A hypothesis that was tested and failed
+
+The obvious explanation was panel width: with 12,196 series a pooled model has
+~100k training rows even at 8 periods each, while 297 synthetic series give
+~900. Holding history fixed at 26 periods and varying the number of series:
+
+| Series in panel | 300 | 1,200 | 5,000 | 12,196 |
+| --- | --- | --- | --- | --- |
+| `lightgbm_global` | **0.467** | **0.452** | **0.461** | **0.458** |
+| `chronos2` | 0.507 | 0.484 | 0.496 | 0.491 |
+
+LightGBM wins at 300 series too, so width is **not** the explanation. The more
+likely remaining account is that the synthetic panel's smooth parametric
+patterns are exactly what a pretrained model extrapolates well, while real
+zero-inflated count demand is better served by a pooled learner on lag features.
+That has not been tested and should not be stated as fact.
+
+### What this does not settle
+
+- **Weekly aggregation.** Chronos-2 may do better on M5's native daily data,
+  closer to its pretraining mix.
+- **Covariates.** Chronos-2 accepts them natively and none are being supplied.
+  Prices, SNAP days and events are sitting unused in
+  `data/raw/m5_walmart_exogenous.parquet`.
+
+Until those are tested, the honest position is that Chronos-2 does not earn a
+3 GB dependency on this evidence, but it has not been given its best shot
+either. It stays registered and enabled; `models.enabled` is where to drop it.
+
+Phase 2 adds the exogenous context layer and conformal prediction intervals,
+with the M5 portfolio run as the number to beat.
