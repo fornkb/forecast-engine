@@ -11,6 +11,8 @@ panel construction, scaling, and rescaling here are model-agnostic.
 
 from __future__ import annotations
 
+import gc
+
 import lightgbm as lgb
 import numpy as np
 import polars as pl
@@ -25,6 +27,11 @@ from engine.features.panel import (
     feature_columns,
 )
 from engine.forecast.base import ForecastContext, Forecaster, register_forecaster
+
+
+def _feature_matrix(frame: pl.DataFrame, features: list[str]) -> np.ndarray:
+    """Feature matrix at float32 — the precision LightGBM actually uses."""
+    return frame.select([pl.col(name).cast(pl.Float32) for name in features]).to_numpy()
 
 
 @register_forecaster
@@ -64,19 +71,32 @@ class GlobalLightGBMForecaster(Forecaster):
         num_boost_round = params.pop("num_boost_round")
         params.pop("max_training_periods", None)
 
+        # LightGBM bins features to float32 internally, so building the matrix at
+        # float64 doubles peak memory for nothing. On a panel of millions of rows
+        # that difference decides whether the run completes.
+        matrix = _feature_matrix(train, features)
+        labels = train["target_scaled"].to_numpy()
+
+        # The training frame carries every lag, rolling and scale intermediate —
+        # far more columns than the feature list. Release it before LightGBM
+        # allocates its own copy.
+        del train
+        gc.collect()
+
         dataset = lgb.Dataset(
-            train.select(features).to_numpy(),
-            label=train["target_scaled"].to_numpy(),
+            matrix,
+            label=labels,
             feature_name=features,
             categorical_feature=categorical,
-            free_raw_data=False,
         )
         booster = lgb.train(params, dataset, num_boost_round=num_boost_round)
+        del dataset, matrix, labels
+        gc.collect()
 
         inference = build_inference_frame(base, horizon, ctx.granularity).join(
             static, on="series_id", how="left"
         )
-        scaled_predictions = booster.predict(inference.select(features).to_numpy())
+        scaled_predictions = booster.predict(_feature_matrix(inference, features))
 
         return inference.select(
             "series_id",
