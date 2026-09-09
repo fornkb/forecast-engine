@@ -84,7 +84,7 @@ exogenous:
   features:
     - mean_sell_price
     - snap_days
-    - is_event
+    - event_days
   level_features:
     - mean_sell_price # also compared against its value at the forecast origin
 cost_model: null

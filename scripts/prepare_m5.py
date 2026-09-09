@@ -88,12 +88,19 @@ def build_exogenous(exogenous: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFram
         .group_by("unique_id", "period")
         .agg(
             pl.col("sell_price").mean().alias("mean_sell_price"),
-            pl.col("snap_CA").max().cast(pl.Float64).alias("snap_days"),
-            # The M5 calendar stores absent events as the string "nan".
+            # Count of SNAP days in the week, not a flag: a week with five
+            # benefit days is a different demand environment from one with a
+            # single day, and a max() throws that distinction away.
+            pl.col("snap_CA").sum().cast(pl.Float64).alias("snap_days"),
+            # Likewise a count of event days. The M5 calendar stores absent
+            # events as the string "nan". Weekly buckets still blunt these
+            # badly — a one-day holiday is smeared across seven days — which is
+            # why the calendar features carry almost no weight at this
+            # granularity and need daily data for a fair test.
             (pl.col("event_type_1").cast(pl.Utf8) != "nan")
-            .any()
+            .sum()
             .cast(pl.Float64)
-            .alias("is_event"),
+            .alias("event_days"),
         )
         .rename({"unique_id": "series_id"})
         .with_columns(pl.col("period").cast(pl.Date), pl.col("mean_sell_price").cast(pl.Float64))
