@@ -78,7 +78,13 @@ models:
     quantile_levels: [0.1, 0.5, 0.9]
     batch_size: 64
 
-# Available in data/raw/m5_walmart_exogenous.parquet — prices, SNAP days, and
-# event calendars, for the context layer in a later phase.
-exogenous_signals: []
+# All three are known ahead of the week they describe: planned shelf prices,
+# the SNAP benefit calendar, and public holidays.
+exogenous:
+  features:
+    - mean_sell_price
+    - snap_days
+    - is_event
+  level_features:
+    - mean_sell_price # also compared against its value at the forecast origin
 cost_model: null

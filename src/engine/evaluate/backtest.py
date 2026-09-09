@@ -81,6 +81,7 @@ def run(
     client: ClientProfile,
     plan: BacktestPlan,
     max_history: int | None = None,
+    exogenous: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Forecast every enabled model at every origin and attach actuals.
 
@@ -90,7 +91,7 @@ def run(
     Returns columns: model, origin, cutoff_period, series_id, period, horizon,
     actual, forecast.
     """
-    ctx = ForecastContext(client=client, series_meta=series_meta)
+    ctx = ForecastContext(client=client, series_meta=series_meta, exogenous=exogenous)
     actuals = history.select("series_id", "period", pl.col("quantity").alias("actual"))
     results: list[pl.DataFrame] = []
 

@@ -1,5 +1,6 @@
 from engine.ingest.base import SourceReader, get_reader, register_reader
 from engine.ingest.excel_reader import ExcelDemandReader
+from engine.ingest.exogenous import read_exogenous
 from engine.ingest.mapping import to_canonical
 from engine.ingest.parquet_reader import CsvPanelReader, ParquetPanelReader
 from engine.ingest.schema import (
@@ -22,6 +23,7 @@ __all__ = [
     "IngestResult",
     "SourceReader",
     "get_reader",
+    "read_exogenous",
     "register_reader",
     "to_canonical",
     "validate_canonical",

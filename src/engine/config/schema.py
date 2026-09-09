@@ -90,6 +90,29 @@ class PatternThresholds(StrictModel):
     volatility_cv: float = Field(default=0.15, ge=0)
 
 
+class ExogenousConfig(StrictModel):
+    """Context features supplied alongside demand history.
+
+    Values are taken at the period being forecast, not at the forecast origin,
+    because these are things a planner knows in advance — a planned shelf price,
+    a promotion calendar, a public holiday. That is what makes them usable as
+    inputs rather than merely explanatory after the fact.
+    """
+
+    features: list[str] = Field(default_factory=list)
+    # Level-valued features (a price, a temperature) additionally get a ratio
+    # against their value at the forecast origin, which is the signal a planner
+    # actually reasons about: not "the price is 3.20" but "the price dropped 20%".
+    level_features: list[str] = Field(default_factory=list)
+
+    def model_post_init(self, _context) -> None:
+        unknown = set(self.level_features) - set(self.features)
+        if unknown:
+            raise ValueError(
+                f"exogenous.level_features {sorted(unknown)} are not listed in exogenous.features"
+            )
+
+
 class SegmentThresholds(StrictModel):
     """Cumulative volume-share boundaries for Head / Mid / Tail segmentation.
 
@@ -206,8 +229,9 @@ class ClientProfile(StrictModel):
     segments: SegmentThresholds = Field(default_factory=SegmentThresholds)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
 
-    # Reserved for later phases so their arrival does not break this schema.
-    exogenous_signals: list[str] = Field(default_factory=list)
+    exogenous: ExogenousConfig = Field(default_factory=ExogenousConfig)
+
+    # Reserved for the decision layer so its arrival does not break this schema.
     cost_model: None = None
 
     @field_validator("client_id")

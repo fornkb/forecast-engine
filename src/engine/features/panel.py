@@ -11,17 +11,27 @@ from __future__ import annotations
 
 import polars as pl
 
-from engine.config.schema import Granularity
+from engine.config.schema import ExogenousConfig, Granularity
 from engine.features.calendar import CALENDAR_FEATURES, add_calendar_features, offset_expr
 
 DEFAULT_LAGS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 9, 12)
 DEFAULT_WINDOWS: tuple[int, ...] = (3, 6, 12)
 
 
+def exogenous_columns(config: ExogenousConfig | None) -> list[str]:
+    """Feature names contributed by the context layer."""
+    if config is None or not config.features:
+        return []
+    names = [f"x_{name}" for name in config.features]
+    names += [f"x_{name}_ratio" for name in config.level_features]
+    return names
+
+
 def feature_columns(
     lags: tuple[int, ...] = DEFAULT_LAGS,
     windows: tuple[int, ...] = DEFAULT_WINDOWS,
     static_features: tuple[str, ...] = (),
+    exogenous: ExogenousConfig | None = None,
 ) -> list[str]:
     """Ordered feature list — the contract between panel building and training."""
     names = [f"s_lag_{lag}" for lag in lags]
@@ -29,7 +39,49 @@ def feature_columns(
         names += [f"s_roll_mean_{window}", f"s_roll_std_{window}", f"zero_frac_{window}"]
     names += ["horizon", "periods_observed", *CALENDAR_FEATURES]
     names += [f"{col}_code" for col in static_features]
+    names += exogenous_columns(exogenous)
     return names
+
+
+def attach_exogenous(
+    panel: pl.DataFrame,
+    exogenous: pl.DataFrame | None,
+    config: ExogenousConfig | None,
+) -> pl.DataFrame:
+    """Join context features at the period being forecast.
+
+    Values are taken at `target_period` rather than at the origin: these are
+    signals known in advance, and using next month's planned price to forecast
+    next month's demand is the whole point of them.
+    """
+    if exogenous is None or config is None or not config.features:
+        return panel
+
+    at_target = exogenous.select(
+        "series_id",
+        pl.col("period").alias("target_period"),
+        *[pl.col(name).alias(f"x_{name}") for name in config.features],
+    )
+    panel = panel.join(at_target, on=["series_id", "target_period"], how="left")
+
+    if not config.level_features:
+        return panel
+
+    at_origin = exogenous.select(
+        "series_id",
+        "period",
+        *[pl.col(name).alias(f"origin_{name}") for name in config.level_features],
+    )
+    panel = panel.join(at_origin, on=["series_id", "period"], how="left")
+
+    ratios = [
+        pl.when(pl.col(f"origin_{name}") > 0)
+        .then(pl.col(f"x_{name}") / pl.col(f"origin_{name}"))
+        .otherwise(None)
+        .alias(f"x_{name}_ratio")
+        for name in config.level_features
+    ]
+    return panel.with_columns(ratios).drop([f"origin_{name}" for name in config.level_features])
 
 
 def add_history_features(

@@ -42,9 +42,8 @@ def build_panel(
 ) -> pl.DataFrame:
     """Aggregate to weekly and map onto the engine's canonical column names."""
     if states:
-        keep = static.filter(pl.col("state_id").is_in(states))["unique_id"]
-        target = target.filter(pl.col("unique_id").is_in(keep))
-        static = static.filter(pl.col("unique_id").is_in(keep))
+        static = static.filter(pl.col("state_id").is_in(states))
+        target = target.join(static.select("unique_id"), on="unique_id", how="semi")
 
     weekly = (
         target.with_columns(pl.col("ds").dt.truncate("1w").alias("period"))
@@ -75,21 +74,29 @@ def build_panel(
 
 
 def build_exogenous(exogenous: pl.DataFrame, panel: pl.DataFrame) -> pl.DataFrame:
-    """Weekly exogenous drivers, kept for the context layer in a later phase."""
-    keep = panel["series_id"].unique()
+    """Weekly exogenous drivers.
+
+    All three are known ahead of the period they describe — planned shelf
+    prices, the SNAP benefit calendar, and public holidays — which is what makes
+    them usable as forecast inputs rather than merely explanatory.
+    """
     return (
-        exogenous.filter(pl.col("unique_id").is_in(keep))
+        exogenous.join(
+            panel.select("series_id").unique(), left_on="unique_id", right_on="series_id"
+        )
         .with_columns(pl.col("ds").dt.truncate("1w").alias("period"))
         .group_by("unique_id", "period")
         .agg(
             pl.col("sell_price").mean().alias("mean_sell_price"),
-            pl.col("snap_CA").max().alias("snap_ca"),
-            pl.col("snap_TX").max().alias("snap_tx"),
-            pl.col("snap_WI").max().alias("snap_wi"),
-            pl.col("event_name_1").drop_nulls().first().alias("event_name"),
-            pl.col("event_type_1").drop_nulls().first().alias("event_type"),
+            pl.col("snap_CA").max().cast(pl.Float64).alias("snap_days"),
+            # The M5 calendar stores absent events as the string "nan".
+            (pl.col("event_type_1").cast(pl.Utf8) != "nan")
+            .any()
+            .cast(pl.Float64)
+            .alias("is_event"),
         )
         .rename({"unique_id": "series_id"})
+        .with_columns(pl.col("period").cast(pl.Date), pl.col("mean_sell_price").cast(pl.Float64))
         .sort("series_id", "period")
     )
 

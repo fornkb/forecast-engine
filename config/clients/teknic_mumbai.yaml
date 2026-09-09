@@ -74,7 +74,9 @@ models:
     quantile_levels: [0.1, 0.5, 0.9]
     batch_size: 64
 
-# Populated in Phase 2 (context layer) and the decision layer — present now so
-# those phases extend this file instead of replacing it.
-exogenous_signals: []
+# No context features for this client — the synthetic panel has no exogenous
+# drivers to supply.
+exogenous:
+  features: []
+  level_features: []
 cost_model: null

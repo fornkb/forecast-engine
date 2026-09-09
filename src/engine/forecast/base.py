@@ -29,6 +29,12 @@ class ForecastContext:
 
     client: ClientProfile
     series_meta: pl.DataFrame
+    # Context features, wide (series_id, period, <feature>...). This deliberately
+    # includes periods beyond the forecast cutoff, which is not leakage: these
+    # are signals known in advance — a planned shelf price, a promotion
+    # calendar, a public holiday. A driver only observable after the fact would
+    # not belong here.
+    exogenous: pl.DataFrame | None = None
 
     @property
     def seasonal_period(self) -> int:

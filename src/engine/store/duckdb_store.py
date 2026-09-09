@@ -44,6 +44,18 @@ CREATE TABLE IF NOT EXISTS fact_demand (
     ingested_at TIMESTAMP NOT NULL
 );
 
+-- Long format: one row per series-period-feature, so a client can add context
+-- signals without a schema migration.
+CREATE TABLE IF NOT EXISTS fact_exogenous (
+    client_id   VARCHAR NOT NULL,
+    series_id   VARCHAR NOT NULL,
+    period      DATE NOT NULL,
+    feature     VARCHAR NOT NULL,
+    value       DOUBLE,
+    source_file VARCHAR NOT NULL,
+    ingested_at TIMESTAMP NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS series_profile (
     client_id         VARCHAR NOT NULL,
     series_id         VARCHAR NOT NULL,
@@ -214,6 +226,47 @@ class EngineStore:
                 "SELECT 1 FROM information_schema.tables WHERE table_name = ?", [name]
             ).fetchall()
         return bool(rows)
+
+    # --------------------------------------------------------------- exogenous
+
+    def replace_exogenous(self, frame: pl.DataFrame) -> None:
+        """Idempotent load of context features, replacing the file's rows."""
+        self.init_schema()
+        source_files = frame["source_file"].unique().to_list()
+        with self.connect() as con:
+            con.register("incoming_exog", frame)
+            con.execute("BEGIN TRANSACTION")
+            for source_file in source_files:
+                con.execute(
+                    "DELETE FROM fact_exogenous WHERE client_id = ? AND source_file = ?",
+                    [self.client_id, source_file],
+                )
+            con.execute("INSERT INTO fact_exogenous BY NAME SELECT * FROM incoming_exog")
+            con.execute("COMMIT")
+
+    def load_exogenous(self, features: list[str]) -> pl.DataFrame | None:
+        """Wide frame of the requested features, or None if none are stored."""
+        if not features or not self.table_exists("fact_exogenous"):
+            return None
+
+        with self.connect() as con:
+            long = con.execute(
+                "SELECT series_id, period, feature, value FROM fact_exogenous "
+                "WHERE client_id = ? AND feature = ANY(?)",
+                [self.client_id, features],
+            ).pl()
+
+        if long.is_empty():
+            return None
+
+        wide = long.pivot(values="value", index=["series_id", "period"], on="feature")
+        missing = [name for name in features if name not in wide.columns]
+        if missing:
+            raise ValueError(
+                f"Exogenous features {missing} are configured but absent from the store. "
+                "Run `engine exogenous` with a file that contains them."
+            )
+        return wide.select("series_id", "period", *features)
 
     # ---------------------------------------------------------------- profiles
 

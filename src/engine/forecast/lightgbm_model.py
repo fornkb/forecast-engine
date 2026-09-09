@@ -21,6 +21,7 @@ from engine.features.panel import (
     DEFAULT_LAGS,
     DEFAULT_WINDOWS,
     add_history_features,
+    attach_exogenous,
     build_inference_frame,
     build_training_frame,
     encode_static_features,
@@ -43,15 +44,16 @@ class GlobalLightGBMForecaster(Forecaster):
     ) -> pl.DataFrame:
         static_features = tuple(ctx.client.models.static_features)
         available = tuple(f for f in static_features if f in ctx.series_meta.columns)
-        features = feature_columns(DEFAULT_LAGS, DEFAULT_WINDOWS, available)
+        exog_config = ctx.client.exogenous
+        features = feature_columns(DEFAULT_LAGS, DEFAULT_WINDOWS, available, exog_config)
         categorical = [f"{column}_code" for column in available]
 
         base = add_history_features(history, DEFAULT_LAGS, DEFAULT_WINDOWS)
         static = encode_static_features(ctx.series_meta, available)
 
-        train = build_training_frame(base, horizon, ctx.granularity).join(
-            static, on="series_id", how="left"
-        )
+        train = attach_exogenous(
+            build_training_frame(base, horizon, ctx.granularity), ctx.exogenous, exog_config
+        ).join(static, on="series_id", how="left")
 
         window = ctx.client.models.lightgbm.max_training_periods
         if window is not None:
@@ -93,9 +95,9 @@ class GlobalLightGBMForecaster(Forecaster):
         del dataset, matrix, labels
         gc.collect()
 
-        inference = build_inference_frame(base, horizon, ctx.granularity).join(
-            static, on="series_id", how="left"
-        )
+        inference = attach_exogenous(
+            build_inference_frame(base, horizon, ctx.granularity), ctx.exogenous, exog_config
+        ).join(static, on="series_id", how="left")
         scaled_predictions = booster.predict(_feature_matrix(inference, features))
 
         return inference.select(

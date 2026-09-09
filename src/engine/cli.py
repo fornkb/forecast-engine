@@ -26,7 +26,7 @@ from engine.features.pattern import (
 from engine.features.segments import assign_volume_segments, segment_summary
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, get_forecaster
-from engine.ingest import get_reader
+from engine.ingest import get_reader, read_exogenous
 from engine.store import EngineStore
 from engine.utils.console import console, log_step
 
@@ -105,6 +105,26 @@ def ingest(
 
 
 @app.command()
+def exogenous(
+    client: ClientOption,
+    file: Annotated[Path, typer.Option("--file", "-f", help="Wide exogenous file.")],
+) -> None:
+    """Load context features (prices, promotions, calendars) into the store."""
+    profile, store = _load(client)
+
+    with log_step(f"Ingesting context features from {file.name}"):
+        frame = read_exogenous(file, profile)
+        store.replace_exogenous(frame)
+
+    console.print(
+        f"   [green]{frame.height:,} values[/green] across "
+        f"{frame['feature'].n_unique()} features "
+        f"({', '.join(profile.exogenous.features)}) "
+        f"for {frame['series_id'].n_unique():,} series"
+    )
+
+
+@app.command()
 def features(client: ClientOption) -> None:
     """Profile every series and classify its demand pattern."""
     profile, store = _load(client)
@@ -179,8 +199,17 @@ def backtest(
         f"horizon {plan.horizon}, models: {', '.join(profile.models.enabled)}"
     )
 
+    context = store.load_exogenous(profile.exogenous.features)
+    if context is not None:
+        console.print(
+            f"   context features: {', '.join(profile.exogenous.features)} "
+            f"({context.height:,} series-periods)"
+        )
+
     with log_step("Backtesting"):
-        predictions = backtest_module.run(fact, dim, profile, plan, max_history=max_history)
+        predictions = backtest_module.run(
+            fact, dim, profile, plan, max_history=max_history, exogenous=context
+        )
 
     with log_step("Scoring"):
         result = scoreboard.compute(predictions, profiles, profile)
