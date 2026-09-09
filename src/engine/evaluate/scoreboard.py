@@ -15,6 +15,7 @@ from engine.config.schema import ClientProfile
 from engine.evaluate.metrics import (
     add_forecast_value_add,
     aggregate,
+    aggregate_probabilistic,
     aggregate_series_level,
     to_long,
 )
@@ -40,12 +41,20 @@ class ScoreboardResult:
 
 
 def _scope(
-    predictions: pl.DataFrame, scope_type: str, scope_column: str | None, baseline: str
+    predictions: pl.DataFrame,
+    scope_type: str,
+    scope_column: str | None,
+    baseline: str,
+    levels: list[float] | None = None,
 ) -> pl.DataFrame:
     group_by = ["model", scope_column] if scope_column else ["model"]
     wide = aggregate(predictions, group_by)
     if scope_type != "series":
         wide = wide.join(aggregate_series_level(predictions, group_by), on=group_by, how="left")
+        if levels:
+            probabilistic = aggregate_probabilistic(predictions, group_by, levels)
+            if probabilistic is not None:
+                wide = wide.join(probabilistic, on=group_by, how="left")
     wide = add_forecast_value_add(wide, baseline, scope_column)
     return to_long(wide, scope_type, scope_column)
 
@@ -125,12 +134,14 @@ def compute(
     ).with_columns(pl.lit(PORTFOLIO_MODEL).alias("model"))
     holdout_with_portfolio = pl.concat([holdout, portfolio])
 
+    levels = client.probabilistic.levels if client.probabilistic.enabled else []
+
     scopes = [
-        _scope(labelled, "overall", None, baseline),
+        _scope(labelled, "overall", None, baseline, levels),
         _scope(labelled, "pattern", "pattern", baseline),
         _scope(labelled, "horizon", "horizon", baseline),
         _scope(labelled, "series", "series_id", baseline),
-        _scope(holdout_with_portfolio, "holdout", None, baseline),
+        _scope(holdout_with_portfolio, "holdout", None, baseline, levels),
         _scope(holdout_with_portfolio, "holdout_pattern", "pattern", baseline),
     ]
     if has_segments:
@@ -372,6 +383,64 @@ def render_cold_start(rows: pl.DataFrame, baseline: str) -> None:
         )
         table.add_row(label, *cells)
     console.print(table)
+
+
+def render_probabilistic(metrics: pl.DataFrame, baseline: str) -> None:
+    """Distribution quality: pinball loss and whether intervals cover reality."""
+    rows = (
+        metrics.filter(
+            (pl.col("scope_type") == "holdout")
+            & pl.col("metric").is_in(["mean_pinball", "interval_coverage", "nominal_coverage"])
+        )
+        .select("model", "metric", "value")
+        .pivot(values="value", index="model", on="metric")
+    )
+    if rows.is_empty() or "mean_pinball" not in rows.columns:
+        return
+
+    rows = rows.filter(pl.col("mean_pinball").is_not_null()).sort("mean_pinball")
+    if rows.is_empty():
+        return
+
+    nominal = rows["nominal_coverage"].drop_nulls()
+    target = float(nominal[0]) if len(nominal) else None
+
+    table = Table(
+        title="Forecast distributions — held-out origin", title_justify="left", header_style="bold"
+    )
+    table.add_column("Model")
+    table.add_column("Mean pinball", justify="right")
+    table.add_column("vs baseline", justify="right")
+    table.add_column("Interval coverage", justify="right")
+
+    baseline_rows = rows.filter(pl.col("model") == baseline)["mean_pinball"]
+    baseline_pinball = float(baseline_rows[0]) if len(baseline_rows) else None
+
+    for row in rows.iter_rows(named=True):
+        is_baseline = row["model"] == baseline
+        skill = "[dim]—[/dim]"
+        if not is_baseline and baseline_pinball:
+            skill = _fva_cell((1 - row["mean_pinball"] / baseline_pinball) * 100)
+
+        coverage = row.get("interval_coverage")
+        if coverage is None:
+            coverage_cell = "[dim]-[/dim]"
+        else:
+            # An interval that covers far less than its nominal level is
+            # overconfident, which is the dangerous direction for safety stock.
+            drift = abs(coverage - target) if target else 0
+            colour = "green" if drift <= 0.05 else "yellow" if drift <= 0.10 else "red"
+            coverage_cell = f"[{colour}]{coverage * 100:.1f}%[/{colour}]"
+
+        label = f"{row['model']}  [dim](baseline)[/dim]" if is_baseline else row["model"]
+        table.add_row(label, _fmt(row["mean_pinball"], 3), skill, coverage_cell)
+
+    console.print(table)
+    if target:
+        console.print(
+            f"[dim]Intervals are nominally {target * 100:.0f}%. Coverage below that is "
+            "overconfidence — the direction that causes stockouts.[/dim]"
+        )
 
 
 def render_selection(selection: pl.DataFrame) -> None:

@@ -75,7 +75,6 @@ models:
   chronos:
     model_id: amazon/chronos-2
     device: cpu
-    quantile_levels: [0.1, 0.5, 0.9]
     batch_size: 64
 
 # All three are known ahead of the week they describe: planned shelf prices,
@@ -87,4 +86,9 @@ exogenous:
     - event_days
   level_features:
     - mean_sell_price # also compared against its value at the forecast origin
+# Quantiles every model is asked to produce. Safety stock and any service-level
+# target need a distribution, not a point.
+probabilistic:
+  enabled: true
+  levels: [0.1, 0.5, 0.9]
 cost_model: null

@@ -17,6 +17,7 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 
+from engine.config.schema import quantile_column
 from engine.features.panel import (
     DEFAULT_LAGS,
     DEFAULT_WINDOWS,
@@ -51,11 +52,16 @@ class GlobalLightGBMForecaster(Forecaster):
         base = add_history_features(history, DEFAULT_LAGS, DEFAULT_WINDOWS)
         static = encode_static_features(ctx.series_meta, available)
 
+        settings = ctx.client.models.lightgbm
         train = attach_exogenous(
-            build_training_frame(base, horizon, ctx.granularity), ctx.exogenous, exog_config
+            build_training_frame(
+                base, horizon, ctx.granularity, settings.target_cap_quantile
+            ),
+            ctx.exogenous,
+            exog_config,
         ).join(static, on="series_id", how="left")
 
-        window = ctx.client.models.lightgbm.max_training_periods
+        window = settings.max_training_periods
         if window is not None:
             cutoff = base["period"].max()
             earliest = (
@@ -69,9 +75,10 @@ class GlobalLightGBMForecaster(Forecaster):
                 "No training rows available — history is shorter than the forecast horizon"
             )
 
-        params = ctx.client.models.lightgbm.model_dump()
+        params = settings.model_dump()
         num_boost_round = params.pop("num_boost_round")
         params.pop("max_training_periods", None)
+        params.pop("target_cap_quantile", None)
 
         # LightGBM bins features to float32 internally, so building the matrix at
         # float64 doubles peak memory for nothing. On a panel of millions of rows
@@ -92,19 +99,46 @@ class GlobalLightGBMForecaster(Forecaster):
             categorical_feature=categorical,
         )
         booster = lgb.train(params, dataset, num_boost_round=num_boost_round)
+
+        # Quantile regression fits one booster per level. The L1 objective
+        # already estimates the median, so the 0.5 level reuses the point
+        # forecast rather than paying for a near-identical fit.
+        quantile_boosters = {
+            level: lgb.train(
+                {**params, "objective": "quantile", "alpha": level},
+                dataset,
+                num_boost_round=num_boost_round,
+            )
+            for level in ctx.quantile_levels
+            if level != 0.5
+        }
+
         del dataset, matrix, labels
         gc.collect()
 
         inference = attach_exogenous(
             build_inference_frame(base, horizon, ctx.granularity), ctx.exogenous, exog_config
         ).join(static, on="series_id", how="left")
-        scaled_predictions = booster.predict(_feature_matrix(inference, features))
+        inference_matrix = _feature_matrix(inference, features)
+
+        point = np.asarray(booster.predict(inference_matrix))
+        outputs = [(pl.Series("scaled", point) * pl.col("scale")).alias("forecast")]
+
+        for level in ctx.quantile_levels:
+            scaled = (
+                point
+                if level == 0.5
+                else np.asarray(quantile_boosters[level].predict(inference_matrix))
+            )
+            outputs.append(
+                (pl.Series(f"scaled_{level}", scaled) * pl.col("scale")).alias(
+                    quantile_column(level)
+                )
+            )
 
         return inference.select(
             "series_id",
             pl.col("target_period").alias("period"),
             "horizon",
-            (pl.Series("scaled", np.asarray(scaled_predictions)) * pl.col("scale")).alias(
-                "forecast"
-            ),
+            *outputs,
         )

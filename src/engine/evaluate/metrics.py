@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import polars as pl
 
+from engine.config.schema import quantile_column
+
 ERROR_METRICS = ("mae", "rmse", "wape", "bias")
 
 
@@ -55,6 +57,65 @@ def aggregate_series_level(predictions: pl.DataFrame, group_by: list[str]) -> pl
     return per_series.group_by(group_by).agg(
         pl.col("series_wape").median().alias("median_series_wape")
     )
+
+
+def pinball_expr(level: float) -> pl.Expr:
+    """Quantile (pinball) loss for one level.
+
+    Under-forecasting a high quantile is penalised more heavily than
+    over-forecasting it, which is what makes this the right loss for a service
+    level: running out is not symmetric with holding a little extra.
+    """
+    column = quantile_column(level)
+    return (
+        pl.when(pl.col("actual") >= pl.col(column))
+        .then(level * (pl.col("actual") - pl.col(column)))
+        .otherwise((1 - level) * (pl.col(column) - pl.col("actual")))
+    )
+
+
+def aggregate_probabilistic(
+    predictions: pl.DataFrame, group_by: list[str], levels: list[float]
+) -> pl.DataFrame | None:
+    """Pinball loss per level, its mean, and empirical interval coverage.
+
+    Returns None when the frame carries no quantiles — a model that only emits a
+    point forecast is scored on point accuracy alone rather than penalised with
+    a placeholder.
+    """
+    available = [level for level in levels if quantile_column(level) in predictions.columns]
+    if not available:
+        return None
+
+    scored = predictions.filter(
+        pl.any_horizontal([pl.col(quantile_column(level)).is_not_null() for level in available])
+    )
+    if scored.is_empty():
+        return None
+
+    exprs = [
+        pinball_expr(level).mean().alias(f"pinball_{quantile_column(level)}") for level in available
+    ]
+
+    # The mean pinball loss across levels approximates CRPS, which is the
+    # single number for "is this whole distribution any good".
+    exprs.append(
+        pl.mean_horizontal([pinball_expr(level) for level in available])
+        .mean()
+        .alias("mean_pinball")
+    )
+
+    if len(available) >= 2:
+        low, high = quantile_column(min(available)), quantile_column(max(available))
+        nominal = max(available) - min(available)
+        exprs.append(
+            ((pl.col("actual") >= pl.col(low)) & (pl.col("actual") <= pl.col(high)))
+            .mean()
+            .alias("interval_coverage")
+        )
+        exprs.append(pl.lit(nominal).alias("nominal_coverage"))
+
+    return scored.group_by(group_by).agg(exprs)
 
 
 def to_long(metrics: pl.DataFrame, scope_type: str, scope_column: str | None) -> pl.DataFrame:

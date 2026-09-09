@@ -16,7 +16,7 @@ from typing import Any
 
 import polars as pl
 
-from engine.config.schema import ChronosParams
+from engine.config.schema import ChronosParams, quantile_column
 from engine.forecast.base import ForecastContext, Forecaster, register_forecaster
 
 _PIPELINE_CACHE: dict[tuple[str, str], Any] = {}
@@ -56,6 +56,7 @@ class Chronos2Forecaster(Forecaster):
         self, history: pl.DataFrame, horizon: int, ctx: ForecastContext
     ) -> pl.DataFrame:
         params = ctx.client.models.chronos
+        levels = ctx.quantile_levels
         pipeline = load_pipeline(params)
 
         context = (
@@ -68,10 +69,14 @@ class Chronos2Forecaster(Forecaster):
             .to_pandas()
         )
 
+        # Ask for the median alongside the configured levels so the point
+        # forecast and the interval come from one pass over the model.
+        requested = sorted({0.5, *levels})
+
         predictions = pipeline.predict_df(
             context,
             prediction_length=horizon,
-            quantile_levels=params.quantile_levels,
+            quantile_levels=requested,
             id_column="id",
             timestamp_column="timestamp",
             target="target",
@@ -79,14 +84,29 @@ class Chronos2Forecaster(Forecaster):
 
         # The median minimises absolute error, which is the metric the scoreboard
         # leads on; the mean would be the right choice for a squared-error metric.
-        median_column = _median_column(params.quantile_levels)
+        median_column = _median_column(requested)
+        frame = pl.from_pandas(predictions)
 
-        return pl.from_pandas(predictions).select(
+        return frame.select(
             pl.col("id").cast(pl.Utf8).alias("series_id"),
             pl.col("timestamp").cast(pl.Date).alias("period"),
             pl.col("timestamp").rank("ordinal").over("id").cast(pl.Int32).alias("horizon"),
             pl.col(median_column).cast(pl.Float64).alias("forecast"),
+            *[
+                pl.col(_level_column(level, frame.columns))
+                .cast(pl.Float64)
+                .alias(quantile_column(level))
+                for level in levels
+            ],
         )
+
+
+def _level_column(level: float, columns: list[str]) -> str:
+    """Chronos names quantile columns by their level, e.g. '0.1'."""
+    for candidate in (f"{level:g}", str(level)):
+        if candidate in columns:
+            return candidate
+    raise KeyError(f"Chronos returned no column for quantile {level}; got {columns}")
 
 
 def _median_column(quantile_levels: list[float]) -> str:

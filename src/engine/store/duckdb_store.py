@@ -17,6 +17,7 @@ import duckdb
 import polars as pl
 
 from engine.config.loader import project_root
+from engine.config.schema import quantile_column
 
 DDL = """
 CREATE SEQUENCE IF NOT EXISTS run_id_seq START 1;
@@ -123,6 +124,20 @@ CREATE TABLE IF NOT EXISTS forecasts (
     horizon       INTEGER NOT NULL,
     model         VARCHAR NOT NULL,
     forecast      DOUBLE
+);
+
+-- Long format so the set of quantile levels can change per client without a
+-- schema migration. Consumed by the decision layer, which needs a distribution
+-- rather than a point to set safety stock against a service level.
+CREATE TABLE IF NOT EXISTS forecast_quantiles (
+    run_id    BIGINT NOT NULL,
+    client_id VARCHAR NOT NULL,
+    series_id VARCHAR NOT NULL,
+    period    DATE NOT NULL,
+    horizon   INTEGER NOT NULL,
+    model     VARCHAR NOT NULL,
+    level     DOUBLE NOT NULL,
+    value     DOUBLE
 );
 
 CREATE TABLE IF NOT EXISTS pattern_validation (
@@ -417,6 +432,50 @@ class EngineStore:
         with self.connect() as con:
             con.register("incoming_forecasts", frame)
             con.execute("INSERT INTO forecasts BY NAME SELECT * FROM incoming_forecasts")
+
+    def write_forecast_quantiles(
+        self, run_id: int, forecasts: pl.DataFrame, levels: list[float]
+    ) -> int:
+        """Persist the quantile columns of a forward forecast in long form."""
+        present = [(level, quantile_column(level)) for level in levels]
+        present = [(level, name) for level, name in present if name in forecasts.columns]
+        if not present:
+            return 0
+
+        frame = (
+            forecasts.select(
+                "series_id",
+                "period",
+                "horizon",
+                "model",
+                *[pl.col(name).alias(str(level)) for level, name in present],
+            )
+            .unpivot(
+                index=["series_id", "period", "horizon", "model"],
+                on=[str(level) for level, _ in present],
+                variable_name="level",
+                value_name="value",
+            )
+            .with_columns(
+                pl.lit(run_id, dtype=pl.Int64).alias("run_id"),
+                pl.lit(self.client_id).alias("client_id"),
+                pl.col("level").cast(pl.Float64),
+            )
+            .drop_nulls("value")
+        )
+
+        with self.connect() as con:
+            con.register("incoming_fq", frame)
+            con.execute("INSERT INTO forecast_quantiles BY NAME SELECT * FROM incoming_fq")
+        return frame.height
+
+    def load_forecast_quantiles(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute(
+                "SELECT * FROM forecast_quantiles WHERE run_id = ? "
+                "ORDER BY series_id, period, level",
+                [run_id],
+            ).pl()
 
     def load_forecasts(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:

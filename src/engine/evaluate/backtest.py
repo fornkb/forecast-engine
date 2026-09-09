@@ -13,9 +13,21 @@ from datetime import date
 
 import polars as pl
 
-from engine.config.schema import ClientProfile
+from engine.config.schema import ClientProfile, quantile_column
 from engine.forecast.base import ForecastContext, get_forecaster
 from engine.utils.console import console
+
+
+PREDICTION_COLUMNS = [
+    "model",
+    "origin",
+    "cutoff_period",
+    "series_id",
+    "period",
+    "horizon",
+    "actual",
+    "forecast",
+]
 
 
 class BacktestError(RuntimeError):
@@ -92,6 +104,7 @@ def run(
     actual, forecast.
     """
     ctx = ForecastContext(client=client, series_meta=series_meta, exogenous=exogenous)
+    quantile_columns = [quantile_column(level) for level in ctx.quantile_levels]
     actuals = history.select("series_id", "period", pl.col("quantity").alias("actual"))
     results: list[pl.DataFrame] = []
 
@@ -116,21 +129,21 @@ def run(
                     "actual to score against"
                 )
 
+            # Models differ in whether they express uncertainty; absent levels
+            # become nulls so every origin's frame shares one schema and is
+            # scored on point accuracy alone.
+            absent = [name for name in quantile_columns if name not in scored.columns]
+
+            # Selected in a fixed order, not just with matching names: a vertical
+            # concat matches columns by position, and models that emit quantiles
+            # place them differently from the nulls filled in here.
             results.append(
                 scored.with_columns(
                     pl.lit(model_name).alias("model"),
                     pl.lit(origin_index, dtype=pl.Int32).alias("origin"),
                     pl.lit(cutoff).cast(pl.Date).alias("cutoff_period"),
-                )
+                    *[pl.lit(None, dtype=pl.Float64).alias(name) for name in absent],
+                ).select(PREDICTION_COLUMNS + quantile_columns)
             )
 
-    return pl.concat(results).select(
-        "model",
-        "origin",
-        "cutoff_period",
-        "series_id",
-        "period",
-        "horizon",
-        "actual",
-        "forecast",
-    )
+    return pl.concat(results)

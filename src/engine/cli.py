@@ -16,6 +16,7 @@ import polars as pl
 import typer
 
 from engine.config import ClientProfile, ConfigError, list_clients, load_client
+from engine.config.schema import quantile_column
 from engine.evaluate import backtest as backtest_module
 from engine.evaluate import scoreboard
 from engine.features.pattern import (
@@ -315,6 +316,7 @@ def _render_run(store: EngineStore, run_id: int, profile: ClientProfile) -> None
     )
     holdout_in_sample = metrics.filter(pl.col("scope_type") == "holdout").is_empty()
     scoreboard.render_holdout(metrics, baseline, holdout_in_sample)
+    scoreboard.render_probabilistic(metrics, baseline)
     scoreboard.render_portfolio_by_scope(metrics, baseline)
     scoreboard.render_portfolio_by_scope(
         metrics, baseline, scope_type="holdout_segment", dimension="volume segment"
@@ -357,11 +359,19 @@ def forecast(
         else [profile.models.baseline]
     )
 
+    quantile_columns = [quantile_column(level) for level in ctx.quantile_levels]
+
     frames = []
     for model_name in models:
         with log_step(f"Forecasting with {model_name}"):
             predictions = get_forecaster(model_name).predict(fact, horizon, ctx)
-            frames.append(predictions.with_columns(pl.lit(model_name).alias("model")))
+            absent = [name for name in quantile_columns if name not in predictions.columns]
+            frames.append(
+                predictions.with_columns(
+                    pl.lit(model_name).alias("model"),
+                    *[pl.lit(None, dtype=pl.Float64).alias(name) for name in absent],
+                )
+            )
 
     combined = pl.concat(frames)
     final = apply_selection(combined, selection) if selection is not None else combined
@@ -371,13 +381,21 @@ def forecast(
 
     run_id = store.start_run("forecast", {"horizon": horizon, "models": models})
     store.write_forecasts(run_id, final)
+    n_quantiles = store.write_forecast_quantiles(run_id, final, ctx.quantile_levels)
 
     console.print(
         f"   [green]{final.height:,} forecasts[/green] for {final['series_id'].n_unique()} series "
         f"({horizon} periods from {cutoff}) — run {run_id}"
     )
-    preview = final.sort("series_id", "period").head(10)
-    console.print(preview.select("series_id", "period", "horizon", "model", "forecast"))
+    if n_quantiles:
+        console.print(
+            f"   [green]{n_quantiles:,} quantile values[/green] at levels "
+            f"{profile.probabilistic.levels}"
+        )
+
+    preview_columns = ["series_id", "period", "horizon", "model", "forecast", *quantile_columns]
+    preview = final.sort("series_id", "period").head(8)
+    console.print(preview.select([c for c in preview_columns if c in preview.columns]))
 
 
 if __name__ == "__main__":

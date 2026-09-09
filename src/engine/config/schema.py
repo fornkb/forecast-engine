@@ -128,6 +128,40 @@ class SegmentThresholds(StrictModel):
             raise ValueError("segments.mid_share must be greater than segments.head_share")
 
 
+class ProbabilisticConfig(StrictModel):
+    """Quantiles every model is asked to produce.
+
+    Defined once at client level rather than per model, so the forecasts being
+    compared are always the same quantiles. Safety stock, reorder points and any
+    service-level target need a distribution, not a point — a point forecast
+    forces the uncertainty to be assumed somewhere else.
+    """
+
+    enabled: bool = True
+    levels: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
+
+    @field_validator("levels")
+    @classmethod
+    def _valid_levels(cls, value: list[float]) -> list[float]:
+        if not value:
+            raise ValueError("probabilistic.levels must not be empty")
+        if any(not 0 < level < 1 for level in value):
+            raise ValueError("probabilistic.levels must all lie strictly between 0 and 1")
+        if len(set(value)) != len(value):
+            raise ValueError("probabilistic.levels must not repeat")
+        return sorted(value)
+
+    @property
+    def column_names(self) -> list[str]:
+        return [quantile_column(level) for level in self.levels]
+
+
+def quantile_column(level: float) -> str:
+    """Column name for a quantile level: 0.1 -> q10, 0.975 -> q97_5."""
+    text = f"{level * 100:g}".replace(".", "_")
+    return f"q{text}"
+
+
 class ChronosParams(StrictModel):
     """Zero-shot foundation model settings.
 
@@ -137,9 +171,6 @@ class ChronosParams(StrictModel):
 
     model_id: str = "amazon/chronos-2"
     device: Literal["cpu", "cuda", "auto"] = "cpu"
-    # The median is taken as the point forecast; the outer levels are retained
-    # because Phase 2's conformal intervals calibrate against them.
-    quantile_levels: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
     batch_size: int = Field(default=64, ge=1)
 
 
@@ -148,6 +179,11 @@ class LightGBMParams(StrictModel):
     # Bounds memory on large panels, and recent history is usually the more
     # relevant signal anyway. None uses everything available.
     max_training_periods: int | None = Field(default=None, ge=2)
+    # Winsorise the scaled training target at this quantile. See
+    # features/panel.build_training_frame — without it, upper-quantile
+    # regression inherits ratios from near-zero-mean series and produces
+    # forecasts orders of magnitude above anything ever observed.
+    target_cap_quantile: float | None = Field(default=0.995, gt=0.5, lt=1.0)
     objective: str = "l1"
     learning_rate: float = 0.05
     num_leaves: int = 31
@@ -230,6 +266,7 @@ class ClientProfile(StrictModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
 
     exogenous: ExogenousConfig = Field(default_factory=ExogenousConfig)
+    probabilistic: ProbabilisticConfig = Field(default_factory=ProbabilisticConfig)
 
     # Reserved for the decision layer so its arrival does not break this schema.
     cost_model: None = None

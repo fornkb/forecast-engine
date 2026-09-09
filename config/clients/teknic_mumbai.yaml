@@ -71,7 +71,6 @@ models:
   chronos: # zero-shot foundation model — pretrained, never fitted here
     model_id: amazon/chronos-2
     device: cpu
-    quantile_levels: [0.1, 0.5, 0.9]
     batch_size: 64
 
 # No context features for this client — the synthetic panel has no exogenous
@@ -79,4 +78,9 @@ models:
 exogenous:
   features: []
   level_features: []
+# Quantiles every model is asked to produce. Safety stock and any service-level
+# target need a distribution, not a point.
+probabilistic:
+  enabled: true
+  levels: [0.1, 0.5, 0.9]
 cost_model: null

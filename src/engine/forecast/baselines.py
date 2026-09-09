@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import polars as pl
 
+from engine.config.schema import quantile_column
 from engine.features.calendar import offset_expr
 from engine.forecast.base import ForecastContext, Forecaster, register_forecaster
 
@@ -34,6 +35,48 @@ def _last_values(history: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _residual_offsets(history: pl.DataFrame, lookback: int, levels: list[float]) -> pl.DataFrame:
+    """Empirical quantiles of the rule's own past errors, per series.
+
+    A naive point forecast becomes a naive *distribution* by adding the spread
+    of the errors that same rule has historically made. Without this the
+    baseline has no interval, and there is nothing to judge a model's
+    uncertainty against — the same trap as scoring accuracy with no baseline.
+    """
+    residuals = (
+        history.sort("series_id", "period")
+        .with_columns(
+            (pl.col("quantity") - pl.col("quantity").shift(lookback).over("series_id")).alias(
+                "residual"
+            )
+        )
+        .drop_nulls("residual")
+    )
+
+    return residuals.group_by("series_id").agg(
+        [
+            pl.col("residual").quantile(level).alias(f"offset_{quantile_column(level)}")
+            for level in levels
+        ]
+    )
+
+
+def _with_quantiles(
+    grid: pl.DataFrame, offsets: pl.DataFrame, levels: list[float], join_on: list[str]
+) -> pl.DataFrame:
+    if not levels:
+        return grid
+    joined = grid.join(offsets, on=join_on, how="left")
+    return joined.with_columns(
+        [
+            (pl.col("forecast") + pl.col(f"offset_{quantile_column(level)}").fill_null(0.0)).alias(
+                quantile_column(level)
+            )
+            for level in levels
+        ]
+    ).drop([f"offset_{quantile_column(level)}" for level in levels])
+
+
 @register_forecaster
 class NaiveForecaster(Forecaster):
     """Repeat the last observed value across the horizon."""
@@ -44,9 +87,25 @@ class NaiveForecaster(Forecaster):
         self, history: pl.DataFrame, horizon: int, ctx: ForecastContext
     ) -> pl.DataFrame:
         grid = _horizon_grid(history, horizon, ctx.granularity)
-        return grid.join(_last_values(history), on="series_id", how="left").select(
+        point = grid.join(_last_values(history), on="series_id", how="left").select(
             "series_id", "period", "horizon", pl.col("last_value").alias("forecast")
         )
+
+        levels = ctx.quantile_levels
+        if not levels:
+            return point
+
+        # A last-value forecast drifts further the longer the horizon, so the
+        # error spread is measured separately at each step.
+        offsets = pl.concat(
+            [
+                _residual_offsets(history, step, levels).with_columns(
+                    pl.lit(step, dtype=pl.Int32).alias("horizon")
+                )
+                for step in range(1, horizon + 1)
+            ]
+        )
+        return _with_quantiles(point, offsets, levels, ["series_id", "horizon"])
 
 
 @register_forecaster
@@ -76,9 +135,18 @@ class SeasonalNaiveForecaster(Forecaster):
             how="left",
         )
 
-        return seasonal.join(_last_values(history), on="series_id", how="left").select(
+        point = seasonal.join(_last_values(history), on="series_id", how="left").select(
             "series_id",
             "period",
             "horizon",
             pl.coalesce("seasonal_value", "last_value").alias("forecast"),
         )
+
+        levels = ctx.quantile_levels
+        if not levels:
+            return point
+
+        # Within one seasonal cycle the error of "same period last cycle" does
+        # not widen with the horizon, so a single spread per series suffices.
+        offsets = _residual_offsets(history, ctx.seasonal_period, levels)
+        return _with_quantiles(point, offsets, levels, ["series_id"])

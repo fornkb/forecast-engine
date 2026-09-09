@@ -44,6 +44,12 @@ class ForecastContext:
     def granularity(self) -> Granularity:
         return self.client.calendar.granularity
 
+    @property
+    def quantile_levels(self) -> list[float]:
+        """Quantiles to produce, or empty when probabilistic output is off."""
+        config = self.client.probabilistic
+        return config.levels if config.enabled else []
+
 
 class Forecaster(ABC):
     """Produces a forecast for every series in `history`.
@@ -69,26 +75,58 @@ class Forecaster(ABC):
         """
 
 
+def _clean_non_negative(column: str) -> pl.Expr:
+    """Nulls and NaNs become zero; demand cannot go below it."""
+    return (
+        pl.when(pl.col(column).is_null() | pl.col(column).is_nan())
+        .then(0.0)
+        .otherwise(pl.col(column).clip(lower_bound=0.0))
+        .alias(column)
+    )
+
+
 def enforce_contract(frame: pl.DataFrame, model_name: str) -> pl.DataFrame:
-    """Guarantee shape, dtypes, and non-negativity of any forecaster's output."""
+    """Guarantee shape, dtypes, and non-negativity of any forecaster's output.
+
+    Quantile columns are optional: a model that cannot express uncertainty
+    simply omits them, and the scoreboard scores it on point accuracy only.
+    """
     missing = [column for column in FORECAST_SCHEMA if column not in frame.columns]
     if missing:
         raise ValueError(f"Forecaster {model_name!r} returned no {missing} column(s)")
+
+    quantile_columns = [c for c in frame.columns if c.startswith("q") and c[1:2].isdigit()]
 
     result = frame.select(
         pl.col("series_id").cast(pl.Utf8),
         pl.col("period").cast(pl.Date),
         pl.col("horizon").cast(pl.Int32),
         pl.col("forecast").cast(pl.Float64),
-    )
+        *[pl.col(name).cast(pl.Float64) for name in quantile_columns],
+    ).with_columns([_clean_non_negative(name) for name in ["forecast", *quantile_columns]])
 
-    # Statistical models can extrapolate below zero; demand cannot go there.
-    return result.with_columns(
-        pl.when(pl.col("forecast").is_null() | pl.col("forecast").is_nan())
-        .then(0.0)
-        .otherwise(pl.col("forecast").clip(lower_bound=0.0))
-        .alias("forecast")
-    )
+    if len(quantile_columns) > 1:
+        # Quantile regression fits each level independently, so nothing stops
+        # the 90th percentile landing below the 10th. Sorting restores a valid
+        # distribution; the alternative is a negative-width interval reaching
+        # the safety-stock calculation.
+        result = _enforce_monotone_quantiles(result, quantile_columns)
+
+    return result
+
+
+def _enforce_monotone_quantiles(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    ordered = sorted(columns, key=_quantile_level)
+    running = pl.col(ordered[0])
+    exprs = [running.alias(ordered[0])]
+    for name in ordered[1:]:
+        running = pl.max_horizontal(running, pl.col(name))
+        exprs.append(running.alias(name))
+    return frame.with_columns(exprs)
+
+
+def _quantile_level(column: str) -> float:
+    return float(column[1:].replace("_", "."))
 
 
 _FORECASTERS: dict[str, type[Forecaster]] = {}

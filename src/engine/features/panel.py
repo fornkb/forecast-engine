@@ -138,9 +138,20 @@ def add_history_features(
 
 
 def build_training_frame(
-    base: pl.DataFrame, horizon: int, granularity: Granularity
+    base: pl.DataFrame,
+    horizon: int,
+    granularity: Granularity,
+    target_cap_quantile: float | None = None,
 ) -> pl.DataFrame:
-    """One row per (series, origin period t, horizon h) with target taken at t+h."""
+    """One row per (series, origin period t, horizon h) with target taken at t+h.
+
+    `target_cap_quantile` winsorises the scaled target. Dividing by a series'
+    expanding mean is unbounded when that mean is near zero: an intermittent
+    series averaging ~1 unit that spikes to 83,000 yields a scaled target of
+    90,000, and a pooled model then carries that ratio over to series averaging
+    100,000. Median regression shrugs this off; upper-quantile regression does
+    not, and produces forecasts orders of magnitude above anything observed.
+    """
     frames = []
     for step in range(1, horizon + 1):
         stepped = base.with_columns(
@@ -159,6 +170,12 @@ def build_training_frame(
 
     panel = pl.concat(frames)
     panel = panel.with_columns((pl.col("target") / pl.col("scale")).alias("target_scaled"))
+
+    if target_cap_quantile is not None and not panel.is_empty():
+        cap = panel["target_scaled"].quantile(target_cap_quantile)
+        if cap is not None and cap > 0:
+            panel = panel.with_columns(pl.col("target_scaled").clip(upper_bound=cap))
+
     return add_calendar_features(panel, "target_period", granularity)
 
 
