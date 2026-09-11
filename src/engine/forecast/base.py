@@ -115,6 +115,21 @@ def enforce_contract(frame: pl.DataFrame, model_name: str) -> pl.DataFrame:
     return result
 
 
+def conform(frame: pl.DataFrame, columns: list[str], quantile_columns: list[str]) -> pl.DataFrame:
+    """Give one model's output the shared schema, in a fixed column order.
+
+    Models differ in whether they express uncertainty, so absent quantile levels
+    are filled with nulls. Order matters as much as names: a vertical concat
+    matches columns by position, and a model that emits quantiles places them
+    differently from nulls appended afterwards. Every multi-model frame in the
+    engine goes through here so that invariant lives in exactly one place.
+    """
+    absent = [name for name in quantile_columns if name not in frame.columns]
+    return frame.with_columns(
+        [pl.lit(None, dtype=pl.Float64).alias(name) for name in absent]
+    ).select(columns + quantile_columns)
+
+
 def _enforce_monotone_quantiles(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     ordered = sorted(columns, key=_quantile_level)
     running = pl.col(ordered[0])

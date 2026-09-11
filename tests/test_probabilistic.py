@@ -7,7 +7,7 @@ import pytest
 
 from engine.config.schema import ClientProfile, ProbabilisticConfig, quantile_column
 from engine.evaluate.metrics import aggregate_probabilistic
-from engine.forecast.base import ForecastContext, enforce_contract, get_forecaster
+from engine.forecast.base import ForecastContext, conform, enforce_contract, get_forecaster
 
 
 def test_quantile_column_names_are_sql_safe():
@@ -115,6 +115,29 @@ def test_baselines_and_pooled_model_emit_usable_intervals(model, history, client
         assert result[name].is_null().sum() == 0
 
     assert (result["q10"] <= result["q90"]).all()
+
+
+def test_models_with_and_without_quantiles_combine_into_one_frame(history, client, series_meta):
+    """Regression: `engine forecast` crashed when one model emitted quantiles and
+    another did not — nulls appended afterwards land in a different column
+    position, and a vertical concat matches by position, not by name."""
+    ctx = ForecastContext(client=client, series_meta=series_meta)
+    quantiles = ["q10", "q50", "q90"]
+    columns = ["series_id", "period", "horizon", "model", "forecast"]
+
+    frames = [
+        conform(
+            get_forecaster(name).predict(history, 2, ctx).with_columns(pl.lit(name).alias("model")),
+            columns,
+            quantiles,
+        )
+        for name in ("croston", "seasonal_naive")  # croston emits no quantiles
+    ]
+    combined = pl.concat(frames)
+
+    assert combined.columns == columns + quantiles
+    assert combined.filter(pl.col("model") == "croston")["q10"].is_null().all()
+    assert combined.filter(pl.col("model") == "seasonal_naive")["q10"].is_not_null().all()
 
 
 def test_probabilistic_can_be_switched_off(history, series_meta):

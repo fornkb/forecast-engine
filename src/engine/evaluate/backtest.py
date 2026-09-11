@@ -14,9 +14,8 @@ from datetime import date
 import polars as pl
 
 from engine.config.schema import ClientProfile, quantile_column
-from engine.forecast.base import ForecastContext, get_forecaster
+from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.utils.console import console
-
 
 PREDICTION_COLUMNS = [
     "model",
@@ -132,18 +131,16 @@ def run(
             # Models differ in whether they express uncertainty; absent levels
             # become nulls so every origin's frame shares one schema and is
             # scored on point accuracy alone.
-            absent = [name for name in quantile_columns if name not in scored.columns]
-
-            # Selected in a fixed order, not just with matching names: a vertical
-            # concat matches columns by position, and models that emit quantiles
-            # place them differently from the nulls filled in here.
             results.append(
-                scored.with_columns(
-                    pl.lit(model_name).alias("model"),
-                    pl.lit(origin_index, dtype=pl.Int32).alias("origin"),
-                    pl.lit(cutoff).cast(pl.Date).alias("cutoff_period"),
-                    *[pl.lit(None, dtype=pl.Float64).alias(name) for name in absent],
-                ).select(PREDICTION_COLUMNS + quantile_columns)
+                conform(
+                    scored.with_columns(
+                        pl.lit(model_name).alias("model"),
+                        pl.lit(origin_index, dtype=pl.Int32).alias("origin"),
+                        pl.lit(cutoff).cast(pl.Date).alias("cutoff_period"),
+                    ),
+                    PREDICTION_COLUMNS,
+                    quantile_columns,
+                )
             )
 
     return pl.concat(results)

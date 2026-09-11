@@ -54,9 +54,7 @@ class GlobalLightGBMForecaster(Forecaster):
 
         settings = ctx.client.models.lightgbm
         train = attach_exogenous(
-            build_training_frame(
-                base, horizon, ctx.granularity, settings.target_cap_quantile
-            ),
+            build_training_frame(base, horizon, ctx.granularity, settings.target_cap_quantile),
             ctx.exogenous,
             exog_config,
         ).join(static, on="series_id", how="left")

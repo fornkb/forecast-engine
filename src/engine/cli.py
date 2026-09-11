@@ -26,10 +26,12 @@ from engine.features.pattern import (
 )
 from engine.features.segments import assign_volume_segments, segment_summary
 from engine.forecast.arbitration import apply_selection
-from engine.forecast.base import ForecastContext, get_forecaster
+from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.ingest import get_reader, read_exogenous
 from engine.store import EngineStore
 from engine.utils.console import console, log_step
+
+FORECAST_OUTPUT_COLUMNS = ["series_id", "period", "horizon", "model", "forecast"]
 
 app = typer.Typer(
     add_completion=False,
@@ -365,11 +367,11 @@ def forecast(
     for model_name in models:
         with log_step(f"Forecasting with {model_name}"):
             predictions = get_forecaster(model_name).predict(fact, horizon, ctx)
-            absent = [name for name in quantile_columns if name not in predictions.columns]
             frames.append(
-                predictions.with_columns(
-                    pl.lit(model_name).alias("model"),
-                    *[pl.lit(None, dtype=pl.Float64).alias(name) for name in absent],
+                conform(
+                    predictions.with_columns(pl.lit(model_name).alias("model")),
+                    FORECAST_OUTPUT_COLUMNS,
+                    quantile_columns,
                 )
             )
 
