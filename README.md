@@ -318,24 +318,37 @@ engine report --client teknic_mumbai --run-id 2 # a specific earlier run
 ### Opening the database directly
 
 Each client's results live in one DuckDB file,
-`data/processed/<client_id>/engine.duckdb`. DuckDB ships a browser-based viewer,
-and it runs from the virtual environment you already have — nothing else to
-install:
+`data/processed/<client_id>/engine.duckdb`. To browse it:
 
 ```bash
-python -c "import duckdb; c = duckdb.connect('data/processed/teknic_mumbai/engine.duckdb', read_only=True); c.sql('CALL start_ui()'); input('Viewer open at http://localhost:4213 - press Enter to close')"
+engine ui --client teknic_mumbai
 ```
 
-Your browser opens on a SQL notebook listing all 11 tables. For example:
+Your browser opens DuckDB's viewer — a SQL notebook with all 11 tables listed
+under `engine`. It opens the file read-only, so nothing in it can be changed by
+accident. Press Enter in the terminal to close it. The viewer itself loads from
+`ui.duckdb.org`, so it needs internet access; your data stays on your machine.
+
+If port 4213 is taken — usually by a viewer you left open — the command says so
+rather than silently showing you the old one. Close that one, or use
+`--port 4214`. `--no-browser` starts it without opening a browser window.
+
+For example, the latest forecast:
 
 ```sql
 SELECT * FROM forecasts WHERE run_id = (SELECT max(run_id) FROM forecasts);
 ```
 
-**Close the viewer before running any `engine` command.** DuckDB lets only one
-process write to a file, and even a read-only viewer blocks that: an engine
-command started while the viewer is open fails with a lock error naming the
-viewer's process ID.
+**Close the viewer before running any other `engine` command.** DuckDB lets
+only one process write to a file, and even a read-only viewer blocks that: an
+engine command started while the viewer is open fails with a lock error naming
+the viewer's process ID.
+
+Opening the file yourself with `duckdb.connect(path, read_only=True)` and then
+starting the viewer does **not** work: read-only applies to the whole session,
+so the viewer cannot create the small database it keeps its notebooks in, and
+fails with `Catalog "_duckdb_ui" does not exist`. `engine ui` avoids this by
+attaching only the engine's file read-only.
 
 If you prefer a desktop tool, [DBeaver](https://dbeaver.io) opens `.duckdb`
 files through its DuckDB driver, and the standalone DuckDB command line installs
@@ -463,6 +476,7 @@ Then re-run steps 1–3. Total: about 42 seconds.
 | `engine coldstart` | Accuracy vs. length of training history | `--client`, `--depths` |
 | `engine report` | Re-render a stored run | `--client`, `--run-id` |
 | `engine forecast` | Forecast forward from end of history | `--client`, `--horizon`, `--model`, `--export` |
+| `engine ui` | Browse the client's database in DuckDB's viewer, read-only | `--client`, `--port`, `--no-browser` |
 
 `--horizon` and `--origins` on `backtest` override the client profile for that
 run only; they do not change the file.

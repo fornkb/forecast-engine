@@ -9,9 +9,12 @@ engine forecast --client teknic_mumbai --horizon 3
 
 from __future__ import annotations
 
+import socket
+import webbrowser
 from pathlib import Path
 from typing import Annotated
 
+import duckdb
 import polars as pl
 import typer
 
@@ -421,6 +424,72 @@ def forecast(
         "in the store; add --export forecasts.csv to get them as a file.[/dim]"
     )
     console.print(preview.select([c for c in preview_columns if c in preview.columns]))
+
+
+@app.command()
+def ui(
+    client: ClientOption,
+    port: Annotated[int, typer.Option(help="Local port for the viewer.")] = 4213,
+    no_browser: Annotated[
+        bool, typer.Option("--no-browser", help="Start the viewer without opening a browser.")
+    ] = False,
+) -> None:
+    """Open this client's results in DuckDB's browser viewer, read-only."""
+    profile, store = _load(client)
+    if not store.path.exists():
+        console.print("[red]No data ingested yet. Run `engine ingest` first.[/red]")
+        raise typer.Exit(code=1)
+
+    # A second viewer on a busy port does not fail — it silently leaves the old
+    # one answering, so the browser shows whatever that earlier viewer shows.
+    if _port_in_use(port):
+        console.print(
+            f"[red]Port {port} is already in use, most likely by an earlier viewer.[/red] "
+            "Close it (press Enter in its terminal), or pick another port with "
+            f"--port {port + 1}."
+        )
+        raise typer.Exit(code=1)
+
+    # The viewer keeps its own notebooks in a separate database it creates on
+    # first use. Opening the engine file with read_only=True makes the whole
+    # session read-only, so that database can never be created and the viewer
+    # fails with 'Catalog "_duckdb_ui" does not exist'. Instead the session is
+    # writable and only the engine's file is attached read-only.
+    con = duckdb.connect()
+    escaped = str(store.path).replace("'", "''")
+    con.execute(f"ATTACH '{escaped}' AS engine (READ_ONLY)")
+    con.execute("USE engine")
+    con.execute("INSTALL ui")
+    con.execute("LOAD ui")
+    con.execute(f"SET ui_local_port = {port}")
+    con.execute("CALL start_ui_server()")
+
+    url = f"http://localhost:{port}"
+    if not no_browser:
+        webbrowser.open(url)
+
+    console.print(f"[bold]{profile.display_name}[/bold] — viewer open at [cyan]{url}[/cyan]")
+    console.print(
+        "   [dim]Read-only. Close it before running other engine commands — "
+        "while it is open they cannot write to the database.[/dim]"
+    )
+    try:
+        input("   Press Enter to close the viewer. ")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    finally:
+        con.execute("CALL stop_ui_server()")
+        con.close()
+        console.print("   [dim]viewer closed[/dim]")
+
+
+def _port_in_use(port: int) -> bool:
+    """True if something is already listening on localhost at this port."""
+    try:
+        with socket.create_connection(("localhost", port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":
