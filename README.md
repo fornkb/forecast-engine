@@ -293,12 +293,53 @@ engine forecast --client teknic_mumbai --horizon 3
 
 Produces 891 forecasts (297 series × 3 months) and stores them.
 
+**The table printed on screen is only a preview of the first 8 rows.** All 891
+are saved in the store. To get every row as a file:
+
+```bash
+engine forecast --client teknic_mumbai --horizon 3 --export forecasts.csv
+```
+
+`.csv` opens directly in Excel; `.parquet` is for other tools. Each row carries
+the customer, item code and description alongside the forecast and its range,
+so the file reads without looking anything up. An unsupported file name is
+refused before the forecast runs.
+
+Some rows have blank `q10`/`q90`: AutoETS and Croston do not produce ranges yet,
+so items assigned to them get a point forecast only.
+
 ### Re-reading results without recomputing
 
 ```bash
 engine report --client teknic_mumbai            # latest backtest run
 engine report --client teknic_mumbai --run-id 2 # a specific earlier run
 ```
+
+### Opening the database directly
+
+Each client's results live in one DuckDB file,
+`data/processed/<client_id>/engine.duckdb`. DuckDB ships a browser-based viewer,
+and it runs from the virtual environment you already have — nothing else to
+install:
+
+```bash
+python -c "import duckdb; c = duckdb.connect('data/processed/teknic_mumbai/engine.duckdb', read_only=True); c.sql('CALL start_ui()'); input('Viewer open at http://localhost:4213 - press Enter to close')"
+```
+
+Your browser opens on a SQL notebook listing all 11 tables. For example:
+
+```sql
+SELECT * FROM forecasts WHERE run_id = (SELECT max(run_id) FROM forecasts);
+```
+
+**Close the viewer before running any `engine` command.** DuckDB lets only one
+process write to a file, and even a read-only viewer blocks that: an engine
+command started while the viewer is open fails with a lock error naming the
+viewer's process ID.
+
+If you prefer a desktop tool, [DBeaver](https://dbeaver.io) opens `.duckdb`
+files through its DuckDB driver, and the standalone DuckDB command line installs
+with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 
 ---
 
@@ -421,7 +462,7 @@ Then re-run steps 1–3. Total: about 42 seconds.
 | `engine backtest` | Rolling-origin evaluation, persists scoreboard | `--client`, `--horizon`, `--origins`, `--max-history` |
 | `engine coldstart` | Accuracy vs. length of training history | `--client`, `--depths` |
 | `engine report` | Re-render a stored run | `--client`, `--run-id` |
-| `engine forecast` | Forecast forward from end of history | `--client`, `--horizon`, `--model` |
+| `engine forecast` | Forecast forward from end of history | `--client`, `--horizon`, `--model`, `--export` |
 
 `--horizon` and `--origins` on `backtest` override the client profile for that
 run only; they do not change the file.

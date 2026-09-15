@@ -28,10 +28,12 @@ from engine.features.segments import assign_volume_segments, segment_summary
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.ingest import get_reader, read_exogenous
-from engine.store import EngineStore
+from engine.store import EngineStore, export_forecasts
+from engine.store.export import SUPPORTED as EXPORT_FORMATS
 from engine.utils.console import console, log_step
 
 FORECAST_OUTPUT_COLUMNS = ["series_id", "period", "horizon", "model", "forecast"]
+PREVIEW_ROWS = 8
 
 app = typer.Typer(
     add_completion=False,
@@ -335,8 +337,21 @@ def forecast(
         str | None,
         typer.Option(help="Force one model instead of per-series arbitration."),
     ] = None,
+    export: Annotated[
+        Path | None,
+        typer.Option(
+            "--export", "-e", help="Also write every forecast to a .csv or .parquet file."
+        ),
+    ] = None,
 ) -> None:
     """Forecast forward from the end of history using the arbitrated portfolio."""
+    if export is not None and export.suffix.lower() not in EXPORT_FORMATS:
+        console.print(
+            f"[red]Cannot export to {export.name!r}: use a "
+            f"{' or '.join(EXPORT_FORMATS)} file name.[/red]"
+        )
+        raise typer.Exit(code=1)
+
     profile, store = _load(client)
     fact, dim = _require_data(store)
     ctx = ForecastContext(client=profile, series_meta=dim)
@@ -395,8 +410,16 @@ def forecast(
             f"{profile.probabilistic.levels}"
         )
 
+    if export is not None:
+        rows = export_forecasts(final, dim, export)
+        console.print(f"   [green]exported {rows:,} rows[/green] to {export.resolve()}")
+
     preview_columns = ["series_id", "period", "horizon", "model", "forecast", *quantile_columns]
-    preview = final.sort("series_id", "period").head(8)
+    preview = final.sort("series_id", "period").head(PREVIEW_ROWS)
+    console.print(
+        f"\n   [dim]Preview — first {PREVIEW_ROWS} of {final.height:,} rows. Every row is saved "
+        "in the store; add --export forecasts.csv to get them as a file.[/dim]"
+    )
     console.print(preview.select([c for c in preview_columns if c in preview.columns]))
 
 
