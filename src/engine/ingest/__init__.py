@@ -3,6 +3,7 @@ from engine.ingest.excel_reader import ExcelDemandReader
 from engine.ingest.exogenous import read_exogenous
 from engine.ingest.mapping import to_canonical
 from engine.ingest.parquet_reader import CsvPanelReader, ParquetPanelReader
+from engine.ingest.postgres_reader import PostgresPanelReader
 from engine.ingest.schema import (
     DIM_SERIES_SCHEMA,
     FACT_DEMAND_SCHEMA,
@@ -19,6 +20,7 @@ __all__ = [
     "ExcelDemandReader",
     "IngestError",
     "ParquetPanelReader",
+    "PostgresPanelReader",
     "IngestReport",
     "IngestResult",
     "SourceReader",

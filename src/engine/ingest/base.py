@@ -17,12 +17,16 @@ _READERS: dict[str, type[SourceReader]] = {}
 
 
 class SourceReader(ABC):
-    """Maps one source file into the canonical dim_series / fact_demand frames."""
+    """Maps one source into the canonical dim_series / fact_demand frames."""
 
     name: ClassVar[str]
+    # A database reader is located by its client profile, not by a path. The CLI
+    # reads this to decide whether --file is required, so neither a missing path
+    # nor a pointless one reaches a reader.
+    requires_path: ClassVar[bool] = True
 
     @abstractmethod
-    def read(self, path: Path, client: ClientProfile) -> IngestResult: ...
+    def read(self, path: Path | None, client: ClientProfile) -> IngestResult: ...
 
 
 def register_reader(cls: type[SourceReader]) -> type[SourceReader]:

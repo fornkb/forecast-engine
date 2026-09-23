@@ -20,8 +20,8 @@ from engine.ingest.schema import IngestError, IngestResult
 class ParquetPanelReader(SourceReader):
     name = "parquet_panel"
 
-    def read(self, path: Path, client: ClientProfile) -> IngestResult:
-        if not path.exists():
+    def read(self, path: Path | None, client: ClientProfile) -> IngestResult:
+        if path is None or not path.exists():
             raise IngestError(f"Source file not found: {path}")
         return to_canonical(pl.read_parquet(path), client, path.name)
 
@@ -30,7 +30,7 @@ class ParquetPanelReader(SourceReader):
 class CsvPanelReader(SourceReader):
     name = "csv_panel"
 
-    def read(self, path: Path, client: ClientProfile) -> IngestResult:
-        if not path.exists():
+    def read(self, path: Path | None, client: ClientProfile) -> IngestResult:
+        if path is None or not path.exists():
             raise IngestError(f"Source file not found: {path}")
         return to_canonical(pl.read_csv(path, try_parse_dates=True), client, path.name)

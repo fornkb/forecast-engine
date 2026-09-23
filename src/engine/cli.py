@@ -30,7 +30,7 @@ from engine.features.pattern import (
 from engine.features.segments import assign_volume_segments, segment_summary
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, conform, get_forecaster
-from engine.ingest import get_reader, read_exogenous
+from engine.ingest import IngestError, get_reader, read_exogenous
 from engine.store import EngineStore, export_forecasts
 from engine.store.export import SUPPORTED as EXPORT_FORMATS
 from engine.utils.console import console, log_step
@@ -93,15 +93,37 @@ def clients() -> None:
 @app.command()
 def ingest(
     client: ClientOption,
-    file: Annotated[Path, typer.Option("--file", "-f", help="Source file to ingest.")],
+    file: Annotated[
+        Path | None,
+        typer.Option("--file", "-f", help="Source file. Omit for database-backed readers."),
+    ] = None,
 ) -> None:
-    """Load a source file into the canonical store (idempotent per source file)."""
+    """Load a source into the canonical store (idempotent per source)."""
     profile, store = _load(client)
 
-    with log_step(f"Ingesting {file.name} for {profile.display_name}"):
-        reader = get_reader(profile.source.reader)
-        result = reader.read(file, profile)
-        store.replace_source(result.dim_series, result.fact_demand)
+    reader = get_reader(profile.source.reader)
+    if reader.requires_path and file is None:
+        console.print(f"[red]Reader {profile.source.reader!r} reads a file; pass --file.[/red]")
+        raise typer.Exit(code=1)
+    if not reader.requires_path and file is not None:
+        # Silently ignoring it would let someone believe they had loaded a file
+        # while the engine read the database.
+        console.print(
+            f"[red]Reader {profile.source.reader!r} reads from the database "
+            "configured in the client profile; --file would be ignored.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    origin = file.name if file else profile.source.database.label
+    try:
+        with log_step(f"Ingesting {origin} for {profile.display_name}"):
+            result = reader.read(file, profile)
+            store.replace_source(result.dim_series, result.fact_demand)
+    except IngestError as exc:
+        # A bad source is an operator problem — an unset variable, a renamed
+        # column — and reads as one. A traceback buries the message.
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     report = result.report
     console.print(
@@ -120,9 +142,13 @@ def exogenous(
     """Load context features (prices, promotions, calendars) into the store."""
     profile, store = _load(client)
 
-    with log_step(f"Ingesting context features from {file.name}"):
-        frame = read_exogenous(file, profile)
-        store.replace_exogenous(frame)
+    try:
+        with log_step(f"Ingesting context features from {file.name}"):
+            frame = read_exogenous(file, profile)
+            store.replace_exogenous(frame)
+    except IngestError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     console.print(
         f"   [green]{frame.height:,} values[/green] across "

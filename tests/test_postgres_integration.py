@@ -1,0 +1,71 @@
+"""Round-trip against a live PostgreSQL.
+
+Deselected by default. Run with a loaded database:
+
+    set ENGINE_PG_DSN=postgresql://engine_reader:<password>@localhost:5432/forecast_erp
+    pytest -m integration
+
+Everything above the driver is covered by test_postgres_reader.py; what only a
+real database can check is that the view's column names, types and grain match
+what the client profile claims.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from engine.config.loader import load_client
+from engine.ingest.base import get_reader
+
+pytestmark = pytest.mark.integration
+
+WORKBOOK = Path("data/raw/Demand_History_3_Years.xlsx")
+
+
+@pytest.fixture(scope="module")
+def result():
+    if not os.environ.get("ENGINE_PG_DSN"):
+        pytest.skip("ENGINE_PG_DSN is not set")
+    profile = load_client("teknic_mumbai_pg")
+    return get_reader(profile.source.reader).read(None, profile)
+
+
+def test_view_maps_cleanly_onto_the_canonical_model(result):
+    """Reaching here at all means the view satisfied every canonical contract —
+    no nulls in keys, no negatives, no duplicate series-periods, no orphans."""
+    assert result.fact_demand.height > 0
+    assert result.report.rows_reconcile
+    assert result.report.quantity_reconciles
+
+
+def test_quantity_is_float_not_decimal(result):
+    assert result.fact_demand.schema["quantity"] == pl.Float64
+
+
+def test_database_matches_the_workbook(result):
+    """The database is a different route to the same numbers. If it disagrees,
+    the view's grain or the column map is wrong."""
+    if not WORKBOOK.exists():
+        pytest.skip(f"{WORKBOOK} not available")
+
+    book = pl.read_excel(WORKBOOK)
+    assert result.report.series_count == book["Series ID"].n_unique()
+    assert result.report.canonical_quantity_sum == pytest.approx(
+        float(book["Demand Quantity"].sum())
+    )
+    assert result.report.period_min == str(book["Demand Month"].min())
+    assert result.report.period_max == str(book["Demand Month"].max())
+
+
+def test_the_engine_role_cannot_write(result):
+    """The grant is SELECT on one view. If this insert succeeds, the engine can
+    corrupt the ERP."""
+    from engine.ingest.postgres_reader import fetch
+    from engine.ingest.schema import IngestError
+
+    with pytest.raises(IngestError):
+        fetch("INSERT INTO erp.sales_history (series_id) VALUES ('x')", os.environ["ENGINE_PG_DSN"])

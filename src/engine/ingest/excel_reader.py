@@ -22,8 +22,8 @@ class ExcelDemandReader(SourceReader):
 
     name = "excel_demand"
 
-    def read(self, path: Path, client: ClientProfile) -> IngestResult:
-        if not path.exists():
+    def read(self, path: Path | None, client: ClientProfile) -> IngestResult:
+        if path is None or not path.exists():
             raise IngestError(f"Source file not found: {path}")
 
         sheet = client.source.sheet

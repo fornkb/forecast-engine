@@ -38,6 +38,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 12. [Scope and limits](#12-scope-and-limits)
 13. [What Phase 1 measured](#13-what-phase-1-measured)
 14. [What M5 changed](#14-what-m5-changed)
+15. [Reading from PostgreSQL](#15-reading-from-postgresql)
 
 ---
 
@@ -50,6 +51,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 | ~4 GB free disk | Virtual environment (~3 GB, mostly PyTorch) plus ~500 MB of model weights |
 | CPU only | No GPU required — Chronos-2 forecasts all 297 series in ~1.6s on CPU |
 | Network, first run only | Chronos-2 weights download from Hugging Face once, then cache |
+| PostgreSQL 14+ | **Optional.** Only to read demand history from a database — see [section 15](#15-reading-from-postgresql) |
 
 Check your Python version:
 
@@ -150,6 +152,8 @@ uv pip install --python .venv/bin/python -e ".[dev,foundation]"           # macO
 ```
 
 `[dev]` adds `pytest` and `ruff`; omit it for a runtime-only install.
+`[postgres]` adds the ADBC driver needed to read from a database; omit it
+for a file-fed install.
 `[foundation]` adds Chronos-2 and PyTorch (~3 GB). To skip it, install plain
 `-e "."` and remove `chronos2` from `models.enabled` in the client profile — the
 rest of the portfolio runs without it, and the engine will tell you clearly if
@@ -362,7 +366,7 @@ with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 pytest
 ```
 
-Expected: **42 passed** in roughly 2 seconds.
+Expected: **90 passed, 5 deselected** in roughly 10 seconds.
 
 For the full list of what each test checks:
 
@@ -370,9 +374,15 @@ For the full list of what each test checks:
 pytest -v
 ```
 
-Nothing should be skipped. A skip means
-`data/raw/Demand_History_3_Years.xlsx` is missing — two integration tests
-depend on it.
+The five deselected tests need something the default run cannot assume:
+
+| Marker | Needs | Run with |
+| --- | --- | --- |
+| `slow` | Chronos-2 weights cached locally | `pytest -m slow` |
+| `integration` | A live PostgreSQL and `ENGINE_PG_DSN` set | `pytest -m integration` |
+
+A *skip* is different from a deselect and means
+`data/raw/Demand_History_3_Years.xlsx` is missing — several tests depend on it.
 
 Lint and formatting:
 
@@ -470,7 +480,7 @@ Then re-run steps 1–3. Total: about 42 seconds.
 | Command | Purpose | Key options |
 | --- | --- | --- |
 | `engine clients` | List configured client profiles | — |
-| `engine ingest` | Load a source file into the canonical store | `--client`, `--file` |
+| `engine ingest` | Load a source into the canonical store | `--client`, `--file` (file readers only) |
 | `engine features` | Profile series and classify demand patterns | `--client` |
 | `engine backtest` | Rolling-origin evaluation, persists scoreboard | `--client`, `--horizon`, `--origins`, `--max-history` |
 | `engine coldstart` | Accuracy vs. length of training history | `--client`, `--depths` |
@@ -483,6 +493,10 @@ run only; they do not change the file.
 
 `--model` on `forecast` forces one model instead of per-series arbitration —
 useful for comparing a single model's forward projection.
+
+`--file` on `ingest` is required for file readers and rejected for database
+readers, which are located by the client profile instead. Passing it to a
+database reader is an error rather than a silent no-op.
 
 ---
 
@@ -559,6 +573,11 @@ Implement `SourceReader` in `src/engine/ingest/`, decorate it with
 only job is producing the canonical `dim_series` + `fact_demand` frames;
 nothing downstream reads source files directly.
 
+A reader that is located by its client profile rather than by a path — a
+database, an API — sets `requires_path = False`; the CLI then rejects `--file`
+for it instead of ignoring it. See
+[section 15](#15-reading-from-postgresql) for the PostgreSQL reader.
+
 ---
 
 ## 10. Project structure
@@ -567,6 +586,8 @@ nothing downstream reads source files directly.
 config/clients/          Client profiles (YAML, validated on load)
 data/raw/                Source files
 data/processed/          Generated — DuckDB + Parquet, gitignored
+scripts/                 Data preparation and loading utilities
+  sql/                   PostgreSQL schema, view and role definitions
 src/engine/
   config/                Typed profile schema and loader
   ingest/                Source readers, canonical schema, validation
@@ -575,7 +596,7 @@ src/engine/
   forecast/              Model portfolio and per-series arbitration
   evaluate/              Metrics, backtest, scoreboard
   cli.py                 Terminal interface
-tests/                   42 tests
+tests/                   95 tests
 ```
 
 ### The model portfolio
@@ -665,14 +686,17 @@ Stated plainly, so nothing here is mistaken for more than it is.
   yearly seasonality, and it limits how many origins can be backtested.
 - **Classifier thresholds were tuned on the labelled sample file** and need
   revalidation against real, unlabelled data.
-- **No exogenous signals, no uncertainty intervals, no decisions.** Forecasts are
-  point estimates in units. Weather, festival calendars, conformal intervals, and
-  ordering recommendations arrive in later phases by design.
+- **No decision layer.** Forecasts are quantities and quantiles. Safety stock,
+  reorder points and the cost of being wrong are not built, so the engine cannot
+  yet say what its accuracy is worth in money.
 - **Intermittent series remain hard.** A median series WAPE near 1.0 on that
   slice reflects the genuine difficulty of mostly-zero demand.
-- **No exogenous signals, no uncertainty intervals, no decisions yet.** Chronos-2
-  produces quantiles and accepts covariates natively, but neither is used yet —
-  those are Phase 2.
+- **Context features are supported but thin.** Exogenous signals are ingested
+  and used where a client supplies them; on M5 they added 1.4%. Teknic has none.
+- **Database input is read-only and full-refresh.** Demand history can come from
+  PostgreSQL, but context features still come from files, forecasts are not
+  written back, and re-ingest replaces everything under a source label rather
+  than merging. See [section 15](#15-reading-from-postgresql).
 
 ---
 
@@ -838,3 +862,174 @@ either. It stays registered and enabled; `models.enabled` is where to drop it.
 
 Phase 2 adds the exogenous context layer and conformal prediction intervals,
 with the M5 portfolio run as the number to beat.
+
+---
+
+## 15. Reading from PostgreSQL
+
+The engine can read demand history from a database instead of a file. This is
+how an ERP integration actually works: the ERP publishes a view, the engine
+reads the view, and the view is the contract between them.
+
+Nothing downstream of ingest changes. Features, models, backtest and
+arbitration all consume the canonical `dim_series` + `fact_demand` frames and
+cannot tell which reader produced them.
+
+### 15.1 What runs where
+
+| | Role |
+|---|---|
+| **PostgreSQL** | System of record — the ERP side. The engine has SELECT on one view and nothing else. |
+| **DuckDB** | The engine's analytical working store. Unchanged, still one file per client. |
+
+Two databases is the right answer, not an accident: one is transactional and
+owned by the ERP, the other is columnar and owned by the engine.
+
+### 15.2 Install the driver
+
+```bash
+pip install -e ".[postgres]"
+```
+
+This pulls `adbc-driver-postgresql` and `pyarrow` — Arrow-native bulk transfer,
+so a large relation does not round-trip through Python objects. The extra is
+separable: a file-fed deployment does not need it.
+
+### 15.3 Create the database
+
+Start the PostgreSQL service if it is not running. On Windows this needs an
+**elevated** prompt — "Run as administrator":
+
+```powershell
+net start postgresql-x64-18
+```
+
+Create the database, then the ERP-shaped schema:
+
+```bash
+psql -U postgres -c "CREATE DATABASE forecast_erp"
+```
+
+```bash
+psql -U postgres -d forecast_erp -f scripts/sql/001_erp_source.sql
+```
+
+This creates `erp.sales_history` (the base table, shaped like a transactional
+system) and `erp.v_demand_history` (the view the engine reads). The view does
+the renaming and the monthly aggregation, which is why a source that posts
+daily lines would need no engine change.
+
+**The view must expose quantity as `double precision`.** The base table keeps
+`NUMERIC(18,3)` — exact decimal, as a system of record should — but the ADBC
+driver maps every PostgreSQL `NUMERIC` to an opaque type that arrives as text.
+Text parses into a float correctly further downstream, so an uncast view
+reconciles perfectly and looks fine while depending entirely on string
+formatting. The reader rejects a non-numeric quantity column outright rather
+than let that pass.
+
+The script is re-runnable: it drops and recreates the view (`CREATE OR REPLACE`
+cannot change a column's type) and reinstates the engine's grant afterwards.
+
+### 15.4 Create the read-only role
+
+The engine must not be able to write to the ERP. Choose a password and set it
+in your shell:
+
+```powershell
+$env:ENGINE_READER_PASSWORD = "<choose one>"   # PowerShell
+set ENGINE_READER_PASSWORD=<choose one>        # cmd.exe
+export ENGINE_READER_PASSWORD='<choose one>'   # bash
+```
+
+Then create the role. The password is passed to `psql` rather than written into
+the script, which is why the script is safe to commit:
+
+```powershell
+psql -U postgres -d forecast_erp -v reader_password="$env:ENGINE_READER_PASSWORD" -f scripts/sql/002_engine_reader.sql
+```
+
+The grant is SELECT on one view — not the base table, not the schema at large.
+
+### 15.5 Load the data
+
+```powershell
+$env:ENGINE_PG_ADMIN_DSN = "postgresql://postgres:<password>@localhost:5432/forecast_erp"
+```
+
+```bash
+python scripts/load_to_postgres.py --file data/raw/Demand_History_3_Years.xlsx --truncate
+```
+
+The admin DSN is deliberately a different credential from the one the engine
+uses: loading needs INSERT, forecasting needs SELECT.
+
+### 15.6 Point the engine at it
+
+```powershell
+$env:ENGINE_PG_DSN = "postgresql://engine_reader:<password>@localhost:5432/forecast_erp"
+```
+
+```bash
+engine ingest --client teknic_mumbai_pg
+```
+
+No `--file` — the reader is located by the client profile. Passing one is an
+error rather than a silent no-op, so nobody can believe they loaded a workbook
+while the engine read the database.
+
+The `teknic_mumbai_pg` profile is the same client as `teknic_mumbai` with a
+different source block, kept alongside it so the two stores can be compared.
+A database source that changes the numbers is a bug.
+
+### 15.7 Credentials
+
+Passwords never go in a client profile. The profile names an environment
+variable:
+
+```yaml
+source:
+  reader: postgres_panel
+  database:
+    dsn_env: ENGINE_PG_DSN
+    relation: erp.v_demand_history
+    where: null          # optional, applied server-side
+    source_label: null   # defaults to "postgres:<relation>"
+```
+
+Driver errors quote the connection string back at you, so everything that
+leaves the reader passes through a scrubber first, and failures are raised
+with `from None` — a chained traceback would reprint the driver's unscrubbed
+message underneath the clean one. There are tests for both.
+
+### 15.8 Re-ingest is a full refresh
+
+`replace_source` is idempotent per source label, and a database relation has no
+filename, so the label defaults to `postgres:erp.v_demand_history`. Re-ingesting
+deletes everything previously loaded under that label and replaces it.
+
+**This means narrowing `where` between runs drops history rather than leaving
+it in place.** Incremental extraction — pull only what changed, upsert the rest
+— is a separate piece of work and is not built.
+
+### 15.9 Testing
+
+Unit tests for the reader run with no database and are always on. The
+round-trip test against a live server is deselected by default:
+
+```bash
+pytest -m integration
+```
+
+It skips unless `ENGINE_PG_DSN` is set. It checks the view's grain and types
+against the canonical contract, reconciles the totals against the workbook, and
+asserts that the engine's role cannot insert.
+
+### 15.10 What is not built
+
+- **Exogenous features from the database.** `engine exogenous` still reads a
+  file. Teknic has no context features, so there was nothing to test a database
+  path against, and untested code is worse than absent code.
+- **Write-back.** Forecasts stay in DuckDB with CSV export. Publishing them to
+  PostgreSQL needs a second role with INSERT rights and a schema the ERP agrees
+  to read — a separate piece of work.
+- **Incremental extraction.** See 15.8.

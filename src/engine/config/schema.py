@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Granularity = Literal["monthly", "weekly", "daily"]
 
@@ -39,12 +39,58 @@ class ColumnMap(StrictModel):
     ground_truth_pattern: str | None = "Demand Pattern"
 
 
+class DatabaseSourceConfig(StrictModel):
+    """Connection details for a database-backed source.
+
+    The password never appears here. `dsn_env` names an environment variable
+    holding the whole DSN, so a profile can be committed and shared while the
+    credential stays on the machine that runs the ingest.
+    """
+
+    dsn_env: str = "ENGINE_PG_DSN"
+    # Schema-qualified view or table. In a real deployment this is a view the
+    # ERP publishes — the integration contract — not a base table.
+    relation: str
+    # Server-side filter, applied before anything crosses the wire.
+    where: str | None = None
+    # Identity used for idempotent re-ingest. Defaults to the relation name,
+    # which is stable and, unlike the DSN, safe to store and print.
+    source_label: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.source_label or f"postgres:{self.relation}"
+
+    @property
+    def query(self) -> str:
+        clause = f" WHERE {self.where}" if self.where else ""
+        return f"SELECT * FROM {self.relation}{clause}"
+
+
 class SourceConfig(StrictModel):
     # Must match a name registered in engine.ingest; kept as a literal so a typo
     # fails at config load rather than at the end of an ingest.
-    reader: Literal["excel_demand", "parquet_panel", "csv_panel"] = "excel_demand"
+    reader: Literal["excel_demand", "parquet_panel", "csv_panel", "postgres_panel"] = "excel_demand"
     sheet: str | None = None
+    database: DatabaseSourceConfig | None = None
     column_map: ColumnMap = Field(default_factory=ColumnMap)
+
+    @model_validator(mode="after")
+    def _database_matches_reader(self) -> SourceConfig:
+        """A database block and a database reader have to agree.
+
+        `extra="forbid"` catches misspelled keys but not a correctly-spelled
+        block attached to a reader that will never look at it — which fails
+        silently, as a file read against a profile that says it uses Postgres.
+        """
+        if self.reader == "postgres_panel" and self.database is None:
+            raise ValueError("reader 'postgres_panel' requires a source.database block")
+        if self.reader != "postgres_panel" and self.database is not None:
+            raise ValueError(
+                f"source.database is set but reader is {self.reader!r}; "
+                "it would be ignored. Use reader 'postgres_panel' or drop the block."
+            )
+        return self
 
 
 class CalendarConfig(StrictModel):
