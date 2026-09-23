@@ -22,6 +22,14 @@ source:
     source_sheet: source_sheet
     ground_truth_pattern: demand_pattern # validation only, never a model feature
 
+# Where published forecasts go. A different role and a different DSN from the
+# source above: the reader sees the ERP's sales history, the writer sees the
+# forecast output, and neither can do the other's job.
+output:
+  postgres:
+    dsn_env: ENGINE_PG_WRITE_DSN
+    target_schema: forecast_output
+
 calendar:
   granularity: monthly
   fiscal_year_start_month: 4

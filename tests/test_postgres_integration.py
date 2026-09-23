@@ -69,3 +69,78 @@ def test_the_engine_role_cannot_write(result):
 
     with pytest.raises(IngestError):
         fetch("INSERT INTO erp.sales_history (series_id) VALUES ('x')", os.environ["ENGINE_PG_DSN"])
+
+
+# --- write-back -----------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def published():
+    """Publish the latest forecast run, and hand back a way to query it."""
+    if not os.environ.get("ENGINE_PG_WRITE_DSN"):
+        pytest.skip("ENGINE_PG_WRITE_DSN is not set")
+    from engine.store import EngineStore, publish_forecasts
+
+    profile = load_client("teknic_mumbai_pg")
+    store = EngineStore(profile.client_id)
+    run_id = store.latest_run("forecast")
+    if run_id is None:
+        pytest.skip("no forecast run in the store; run `engine forecast` first")
+    return publish_forecasts(store, profile, run_id)
+
+
+def _query(sql: str):
+    import adbc_driver_postgresql.dbapi as pg
+
+    with pg.connect(os.environ["ENGINE_PG_WRITE_DSN"]) as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        return cur.fetchall()
+
+
+def test_published_rows_are_visible_through_the_current_view(published):
+    rows, series = _query(
+        "SELECT count(*), count(DISTINCT series_id) "
+        "FROM forecast_output.v_current_forecast "
+        f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published.run_id}"
+    )[0]
+    assert rows == published.forecast_rows
+    assert series == published.series_count
+
+
+def test_republishing_replaces_rather_than_duplicates(published):
+    """The command has to be safe to re-run after a partial failure."""
+    from engine.store import EngineStore, publish_forecasts
+
+    profile = load_client("teknic_mumbai_pg")
+    again = publish_forecasts(EngineStore(profile.client_id), profile, published.run_id)
+
+    total = _query(
+        "SELECT count(*) FROM forecast_output.demand_forecast "
+        f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published.run_id}"
+    )[0][0]
+    assert total == again.forecast_rows == published.forecast_rows
+
+
+def test_quantiles_arrive_sorted_and_complete(published):
+    levels = [
+        r[0]
+        for r in _query(
+            "SELECT DISTINCT level FROM forecast_output.v_current_forecast_quantile "
+            f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published.run_id} ORDER BY level"
+        )
+    ]
+    assert levels == sorted(levels)
+    assert levels == load_client("teknic_mumbai_pg").probabilistic.levels
+
+
+def test_the_writer_role_cannot_reach_the_erp_schema(published):
+    """Read and write are different roles. If the writer can see sales history,
+    a mistake in the publish path can reach the ERP's own data."""
+    import adbc_driver_postgresql.dbapi as pg
+
+    with (
+        pytest.raises(Exception, match="(?i)permission denied"),
+        pg.connect(os.environ["ENGINE_PG_WRITE_DSN"]) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute("SELECT 1 FROM erp.v_demand_history LIMIT 1")

@@ -31,7 +31,7 @@ from engine.features.segments import assign_volume_segments, segment_summary
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.ingest import IngestError, get_reader, read_exogenous
-from engine.store import EngineStore, export_forecasts
+from engine.store import EngineStore, PublishError, export_forecasts, publish_forecasts
 from engine.store.export import SUPPORTED as EXPORT_FORMATS
 from engine.utils.console import console, log_step
 
@@ -450,6 +450,42 @@ def forecast(
         "in the store; add --export forecasts.csv to get them as a file.[/dim]"
     )
     console.print(preview.select([c for c in preview_columns if c in preview.columns]))
+
+
+@app.command()
+def publish(
+    client: ClientOption,
+    run_id: Annotated[
+        int | None, typer.Option(help="Forecast run to publish. Defaults to the latest.")
+    ] = None,
+) -> None:
+    """Write a stored forecast into the ERP database."""
+    profile, store = _load(client)
+
+    if run_id is None:
+        run_id = store.latest_run("forecast")
+        if run_id is None:
+            console.print("[red]No forecast run found. Run `engine forecast` first.[/red]")
+            raise typer.Exit(code=1)
+
+    try:
+        with log_step(f"Publishing run {run_id} for {profile.display_name}"):
+            report = publish_forecasts(store, profile, run_id)
+    except PublishError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"   [green]{report.forecast_rows:,} forecasts[/green] for "
+        f"{report.series_count} series ({report.horizon} periods from "
+        f"{report.cutoff_period}) -> {report.target}"
+    )
+    if report.quantile_rows:
+        console.print(f"   [green]{report.quantile_rows:,} quantile values[/green]")
+    console.print(
+        "   [dim]the ERP reads forecast_output.v_current_forecast, which now "
+        f"resolves to run {report.run_id}[/dim]"
+    )
 
 
 @app.command()

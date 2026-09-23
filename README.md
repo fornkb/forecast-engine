@@ -39,6 +39,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 13. [What Phase 1 measured](#13-what-phase-1-measured)
 14. [What M5 changed](#14-what-m5-changed)
 15. [Reading from PostgreSQL](#15-reading-from-postgresql)
+16. [Publishing forecasts back](#16-publishing-forecasts-back)
 
 ---
 
@@ -366,7 +367,7 @@ with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 pytest
 ```
 
-Expected: **90 passed, 5 deselected** in roughly 10 seconds.
+Expected: **97 passed, 9 deselected** in roughly 15 seconds.
 
 For the full list of what each test checks:
 
@@ -379,7 +380,7 @@ The five deselected tests need something the default run cannot assume:
 | Marker | Needs | Run with |
 | --- | --- | --- |
 | `slow` | Chronos-2 weights cached locally | `pytest -m slow` |
-| `integration` | A live PostgreSQL and `ENGINE_PG_DSN` set | `pytest -m integration` |
+| `integration` | A live PostgreSQL, with `ENGINE_PG_DSN` and `ENGINE_PG_WRITE_DSN` set | `pytest -m integration` |
 
 A *skip* is different from a deselect and means
 `data/raw/Demand_History_3_Years.xlsx` is missing — several tests depend on it.
@@ -486,6 +487,7 @@ Then re-run steps 1–3. Total: about 42 seconds.
 | `engine coldstart` | Accuracy vs. length of training history | `--client`, `--depths` |
 | `engine report` | Re-render a stored run | `--client`, `--run-id` |
 | `engine forecast` | Forecast forward from end of history | `--client`, `--horizon`, `--model`, `--export` |
+| `engine publish` | Write a stored forecast into the ERP database | `--client`, `--run-id` |
 | `engine ui` | Browse the client's database in DuckDB's viewer, read-only | `--client`, `--port`, `--no-browser` |
 
 `--horizon` and `--origins` on `backtest` override the client profile for that
@@ -591,12 +593,12 @@ scripts/                 Data preparation and loading utilities
 src/engine/
   config/                Typed profile schema and loader
   ingest/                Source readers, canonical schema, validation
-  store/                 DuckDB persistence (all SQL lives here)
+  store/                 DuckDB persistence, file export, PostgreSQL write-back
   features/              Calendar features, panel construction, pattern profiling
   forecast/              Model portfolio and per-series arbitration
   evaluate/              Metrics, backtest, scoreboard
   cli.py                 Terminal interface
-tests/                   95 tests
+tests/                   106 tests
 ```
 
 ### The model portfolio
@@ -693,10 +695,11 @@ Stated plainly, so nothing here is mistaken for more than it is.
   slice reflects the genuine difficulty of mostly-zero demand.
 - **Context features are supported but thin.** Exogenous signals are ingested
   and used where a client supplies them; on M5 they added 1.4%. Teknic has none.
-- **Database input is read-only and full-refresh.** Demand history can come from
-  PostgreSQL, but context features still come from files, forecasts are not
-  written back, and re-ingest replaces everything under a source label rather
-  than merging. See [section 15](#15-reading-from-postgresql).
+- **The database round trip is demand only.** Demand history is read from
+  PostgreSQL and forecasts are published back, but context features still come
+  from files, and re-ingest replaces everything under a source label rather than
+  merging. See sections [15](#15-reading-from-postgresql)
+  and [16](#16-publishing-forecasts-back).
 
 ---
 
@@ -1033,3 +1036,114 @@ asserts that the engine's role cannot insert.
   PostgreSQL needs a second role with INSERT rights and a schema the ERP agrees
   to read — a separate piece of work.
 - **Incremental extraction.** See 15.8.
+
+---
+
+## 16. Publishing forecasts back
+
+Reading from the ERP is half an integration. A forecast that lives in a DuckDB
+file or a CSV is not something an ERP screen can show a planner. `engine publish`
+writes a completed forecast run into a schema the ERP reads.
+
+The engine's own store stays the source of truth. Publishing copies one finished
+run out; it never reads back.
+
+### 16.1 Two roles, not one
+
+| Role | Sees | Can |
+| --- | --- | --- |
+| `engine_reader` | `erp.v_demand_history` | SELECT only |
+| `engine_writer` | `forecast_output.*` | SELECT, INSERT, DELETE |
+
+Neither can do the other's job. A mistake in the publish path has no route to
+the ERP's sales history, and there is an integration test asserting exactly
+that. They use different DSNs, in different environment variables, for the same
+reason.
+
+### 16.2 Create the output schema and the writer
+
+```bash
+psql -U postgres -d forecast_erp -f scripts/sql/003_forecast_output.sql
+```
+
+```powershell
+$env:ENGINE_WRITER_PASSWORD = "<choose one>"
+```
+
+```powershell
+psql -U postgres -d forecast_erp -v writer_password="$env:ENGINE_WRITER_PASSWORD" -f scripts/sql/004_engine_writer.sql
+```
+
+### 16.3 Publish
+
+```powershell
+$env:ENGINE_PG_WRITE_DSN = "postgresql://engine_writer:<password>@localhost:5432/forecast_erp"
+```
+
+```bash
+engine publish --client teknic_mumbai_pg
+```
+
+Without `--run-id` it publishes the latest forecast run. Add the output block to
+the client profile first:
+
+```yaml
+output:
+  postgres:
+    dsn_env: ENGINE_PG_WRITE_DSN
+    target_schema: forecast_output
+```
+
+A client with no `output` block has nowhere to publish to and says so. That is
+deliberate — a publish target should never be acquired by accident.
+
+### 16.4 What the ERP reads
+
+| Object | Contents |
+| --- | --- |
+| `v_current_forecast` | **The live forecast.** What an ERP should read. |
+| `v_current_forecast_quantile` | Its quantiles, long form |
+| `demand_forecast` | Every published run, for history and accuracy tracking |
+| `forecast_run` | One row per publish: cutoff, horizon, row count, timestamp |
+
+"Current" is the most recently *published* run, not the highest run id —
+republishing an older run is a deliberate act and takes effect.
+
+Quantiles are stored long (one row per level) rather than as `q10`/`q50`/`q90`
+columns, because the set of levels is client configuration. A client that wants
+a 95% service level should not need a schema migration. An ERP wanting wide
+columns can pivot in its own view.
+
+### 16.5 Republishing is safe
+
+Publishing the same run twice replaces it rather than duplicating it, and the
+whole run — summary, forecasts and quantiles — goes in one transaction. A
+partial publish would leave the ERP reading a forecast covering some items and
+not others, which is worse than no forecast at all.
+
+### 16.6 A note on local authentication
+
+A default PostgreSQL install on Windows ships with `trust` authentication for
+connections from `127.0.0.1`:
+
+```
+host    all    all    127.0.0.1/32    trust
+```
+
+**Any local connection is accepted regardless of password.** Role *privileges*
+are still enforced — `engine_writer` genuinely cannot read the `erp` schema —
+but the passwords are not checked from localhost, so the separation is by
+privilege rather than by credential.
+
+Before this runs anywhere but a development machine, change both `trust` lines
+in `pg_hba.conf` to `scram-sha-256` and reload the server. The tests in this
+repo point at a closed port rather than localhost for the same reason: a unit
+test with a plausible DSN will otherwise reach a live database.
+
+### 16.7 What is still not built
+
+- **Nothing reads the forecast back.** No ERP screen, no reorder suggestion, no
+  accuracy tracking against what actually sold. The rows are there; consuming
+  them is the ERP side of the work.
+- **No decision layer.** The published numbers are quantities and quantiles, not
+  reorder points or safety stock. See [section 12](#12-scope-and-limits).

@@ -11,7 +11,10 @@ from engine.ingest import postgres_reader
 from engine.ingest.base import get_reader
 from engine.ingest.schema import IngestError
 
-DSN = "postgresql://engine_reader:hunter2@localhost:5432/forecast_erp"
+# Port 1, so nothing here can reach a real database even by accident. A
+# localhost DSN would: PostgreSQL installs commonly trust local connections,
+# and a wrong password is still let in.
+DSN = "postgresql://engine_reader:hunter2@127.0.0.1:1/forecast_erp"
 
 
 def _profile() -> ClientProfile:

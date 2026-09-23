@@ -93,6 +93,34 @@ class SourceConfig(StrictModel):
         return self
 
 
+class PostgresOutputConfig(StrictModel):
+    """Where published forecasts are written.
+
+    A different environment variable from the source DSN, because it is a
+    different role: the reader sees the ERP's sales history and nothing else,
+    the writer sees the forecast output and nothing else.
+    """
+
+    # Named target_schema rather than schema, which collides with a BaseModel
+    # attribute.
+    dsn_env: str = "ENGINE_PG_WRITE_DSN"
+    target_schema: str = "forecast_output"
+
+    @field_validator("target_schema")
+    @classmethod
+    def _plain_identifier(cls, value: str) -> str:
+        # Interpolated into SQL, so it never gets to contain anything clever.
+        if not value.replace("_", "").isalnum():
+            raise ValueError("target_schema must be alphanumeric with underscores only")
+        return value
+
+
+class OutputConfig(StrictModel):
+    """Where results go beyond the engine's own store. Absent means nowhere."""
+
+    postgres: PostgresOutputConfig | None = None
+
+
 class CalendarConfig(StrictModel):
     granularity: Granularity = "monthly"
     fiscal_year_start_month: int = Field(default=4, ge=1, le=12)
@@ -304,6 +332,7 @@ class ClientProfile(StrictModel):
     display_name: str
     currency: str = "INR"
     source: SourceConfig = Field(default_factory=SourceConfig)
+    output: OutputConfig = Field(default_factory=OutputConfig)
     calendar: CalendarConfig = Field(default_factory=CalendarConfig)
     hierarchy: HierarchyConfig = Field(default_factory=HierarchyConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
