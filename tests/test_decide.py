@@ -98,10 +98,27 @@ def test_a_perfect_forecast_costs_nothing():
     assert costed["decision_cost"].item() == pytest.approx(0.0)
 
 
-def test_fill_rate_reports_the_service_level_actually_achieved():
-    costed = with_decision_costs(_scored([("m", 90.0, 100.0)]), COST)
+def test_cycle_service_level_counts_periods_not_units():
+    """The calibration measure: how often stock covered demand at all."""
+    costed = with_decision_costs(
+        _scored([("m", 100.0, 90.0), ("m", 100.0, 95.0), ("m", 100.0, 200.0)]), COST
+    )
+    # Two of three periods were covered.
+    assert aggregate(costed, ["model"])["cycle_service_level"].item() == pytest.approx(2 / 3)
+
+
+def test_fill_rate_exceeds_cycle_service_level_when_shortfalls_are_partial():
+    """This distinction is why comparing fill rate against the target quantile is
+    wrong: a period that stocks out still serves most of its units, so fill rate
+    reads high even when calibration is exact. An earlier version of this code
+    compared the two and reported every model as over-stocking."""
+    costed = with_decision_costs(_scored([("m", 100.0, 90.0)] * 9 + [("m", 100.0, 110.0)]), COST)
     summary = aggregate(costed, ["model"])
-    assert summary["fill_rate"].item() == pytest.approx(0.9)
+
+    # Nine of ten periods covered: exactly the 90th percentile's promise.
+    assert summary["cycle_service_level"].item() == pytest.approx(0.9)
+    # But only 10 units short out of 920 demanded, so fill rate is far higher.
+    assert summary["fill_rate"].item() > 0.98
 
 
 def test_zero_demand_leaves_fill_rate_undefined_rather_than_perfect():
@@ -156,7 +173,10 @@ def test_to_long_emits_one_row_per_metric():
     )
     long = to_long(summary, "holdout", None)
     assert set(long.columns) == {"model", "scope_type", "scope_value", "metric", "value", "n_obs"}
-    assert "decision_cost" in long["metric"].to_list()
+    metrics = long["metric"].to_list()
+    assert "decision_cost" in metrics
+    # Both service measures are persisted, so a later run can tell them apart.
+    assert {"cycle_service_level", "fill_rate"} <= set(metrics)
     assert long["scope_value"].unique().to_list() == ["__all__"]
 
 

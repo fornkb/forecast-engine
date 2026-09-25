@@ -368,7 +368,7 @@ with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 pytest
 ```
 
-Expected: **116 passed, 9 deselected** in roughly 13 seconds.
+Expected: **133 passed, 9 deselected** in roughly 13 seconds.
 
 For the full list of what each test checks:
 
@@ -601,7 +601,7 @@ src/engine/
   evaluate/              Metrics, backtest, scoreboard
   decide/                Inventory policy, decision cost, reporting
   cli.py                 Terminal interface
-tests/                   125 tests
+tests/                   142 tests
 ```
 
 ### The model portfolio
@@ -1238,12 +1238,14 @@ so Head items are compared against the baseline's Head cost.
 
 ### 17.4 Measured on the Teknic panel
 
-| Model | Decision cost | Held | Short | Fill rate | DVA |
-| --- | --- | --- | --- | --- | --- |
-| `lightgbm_global` | 1,867,686 | 1,507,051 | 40,071 | 98.7% | **+21.2%** |
-| `seasonal_naive` | 2,370,937 | 1,574,977 | 88,440 | 97.0% | baseline |
-| `chronos2` | 2,421,259 | 1,820,284 | 66,775 | 97.8% | −2.1% |
-| `naive` | 3,197,545 | 2,747,095 | 50,050 | 98.3% | −34.9% |
+Uncalibrated quantiles, held-out origin:
+
+| Model | Decision cost | Held | Short | Service | Fill rate | DVA |
+| --- | --- | --- | --- | --- | --- | --- |
+| `lightgbm_global` | 1,867,686 | 1,507,051 | 40,071 | 86.8% | 98.7% | **+21.2%** |
+| `seasonal_naive` | 2,370,937 | 1,574,977 | 88,440 | 87.4% | 97.0% | baseline |
+| `chronos2` | 2,421,259 | 1,820,284 | 66,775 | 92.0% | 97.8% | −2.1% |
+| `naive` | 3,197,545 | 2,747,095 | 50,050 | 89.5% | 98.3% | −34.9% |
 
 Two things worth reading off this. LightGBM avoids **21% of the baseline's
 decision cost**, consistently across Head, Mid and Tail. And **Chronos-2 costs
@@ -1251,16 +1253,71 @@ more than the baseline** despite winning on accuracy for many individual series 
 its intervals are wide, so it over-stocks. Accuracy and decision quality are not
 the same ranking.
 
-### 17.5 Calibration is the check that makes the rest trustworthy
+**Two service measures, and only one of them is a calibration check.** `Service`
+is the cycle service level: the share of periods in which stock covered demand.
+That is what stocking to a quantile promises. `Fill rate` is the share of
+demanded *units* served, and it is always higher — a period that stocks out
+still serves most of its units. Comparing fill rate against the target quantile
+looks like miscalibration when nothing is wrong, and an earlier version of this
+code did exactly that and reported every model as over-stocking.
 
-A model stocking to its own 90th percentile should serve about 90% of demand. On
-the Teknic panel every model serves 97–99%, so every model's intervals are too
-wide and every model over-stocks. `engine decide` prints this as a warning.
+### 17.5 Calibration
 
-This is a real finding, not a rounding artefact: it means the p90s are too high,
-the portfolio holds more inventory than the configured service level asks for,
-and no accuracy metric reports it. Narrowing them is a model-layer fix that now
-has a number attached to it.
+A model stocking to its own 90th percentile should go a stockout-free 90% of
+periods. Measured on cycle service level, and bootstrapped over series to respect
+the clustering, three of the four models miss that:
+
+| Model | Cycle service level | 95% CI | vs 90% target |
+| --- | --- | --- | --- |
+| `chronos2` | 92.0% | [90.0%, 93.9%] | marginally too wide |
+| `naive` | 89.5% | [86.8%, 92.0%] | on target |
+| `seasonal_naive` | 87.4% | [85.0%, 89.7%] | too narrow |
+| `lightgbm_global` | 86.8% | [84.0%, 89.3%] | too narrow |
+
+The deviations are real but small, and they cannot be fixed inside the models.
+The naive family estimates its interval from about two dozen residuals per
+series, where the empirical upper quantile is biased low. The gradient-boosted
+model winsorizes its training target at 0.995 — clipping exactly the tail its
+upper quantile is trying to find — and that winsorization exists to fix an
+earlier bug. Chronos-2's quantiles come out of pretrained weights.
+
+So the correction is **conformal and applied afterwards**, identically to every
+model: measure how far each quantile actually sat from the demand it claimed to
+cover, and shift it by that much. Offsets are fitted on the backtest's earlier
+origins and never on the final one, the same split arbitration uses. They are
+expressed as a multiple of each series' mean demand, because demand here spans
+four orders of magnitude and a raw unit offset would swamp small series and
+vanish on large ones.
+
+It is on by default:
+
+```yaml
+probabilistic:
+  calibrate: true
+```
+
+**What it buys, measured by leave-one-origin-out over all three origins:**
+
+| Model | Coverage gap | Decision cost |
+| --- | --- | --- |
+| `lightgbm_global` | 4.7% → **2.0%** | −1.5% |
+| `seasonal_naive` | 4.1% → **1.5%** | +2.3% |
+| `chronos2` | 1.8% → **0.8%** | −0.6% |
+| `naive` | 1.0% → **0.5%** | +0.4% |
+| **Portfolio** | — | **+0.1%** |
+
+**It roughly halves every coverage gap and changes decision cost by nothing.**
+That is the newsvendor cost curve being flat near its optimum: being three points
+off the optimal quantile is a second-order cost error. So calibration is on for
+the honesty of the number, not for a saving — a `target_stock` derived from an
+under-covering p90 under-delivers the service level it is sold as, and that is a
+correctness problem whatever it costs.
+
+`engine decide` prints the before-and-after per model, because a correction fitted
+on earlier origins can overshoot on a later one and the only way to know is to
+look. On the final Teknic origin `lightgbm_global` goes 86.8% → 93.3%, which is no
+closer; averaged over all three folds its gap more than halves. Set
+`calibrate: false` to turn it off.
 
 ### 17.6 Stock levels
 
@@ -1296,6 +1353,9 @@ that can support a decision.
 
 - **Arbitration still selects on accuracy**, not on decision cost. Measuring
   first was deliberate — now we know the two rankings disagree, and by how much.
+- **Calibration is one offset per model and level**, not per segment or horizon.
+  Coverage varies by only 1–3 points across origins and horizons on this panel,
+  so a finer correction would fit noise; that may not hold on a larger portfolio.
 - **Decisions are not published.** `engine publish` writes forecasts, not stock
   levels. Nothing in the ERP reads a reorder point yet.
 - **No carryover simulation.** See 17.3.

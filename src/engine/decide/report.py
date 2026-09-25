@@ -13,6 +13,10 @@ def _fmt(value: float | None, digits: int = 1) -> str:
     return "-" if value is None else f"{value:,.{digits}f}"
 
 
+def _pct(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1%}"
+
+
 def _dva_cell(value: float | None) -> str:
     if value is None:
         return "-"
@@ -42,6 +46,7 @@ def render_decision_cost(summary: pl.DataFrame, baseline: str) -> None:
     table.add_column("Decision cost", justify="right")
     table.add_column("Held", justify="right")
     table.add_column("Short", justify="right")
+    table.add_column("Service", justify="right")
     table.add_column("Fill rate", justify="right")
     table.add_column("DVA", justify="right")
 
@@ -52,43 +57,57 @@ def render_decision_cost(summary: pl.DataFrame, baseline: str) -> None:
             _fmt(row["decision_cost"], 0),
             _fmt(row["units_held"], 0),
             _fmt(row["units_short"], 0),
-            "-" if row["fill_rate"] is None else f"{row['fill_rate']:.1%}",
+            _pct(row.get("cycle_service_level")),
+            _pct(row.get("fill_rate")),
             _dva_cell(row.get("dva_pct")),
         )
     console.print(table)
     console.print(
         f"   [dim]{baseline} is the baseline. DVA is the share of its decision cost "
         "avoided. Holding and shortage are weighted by the configured ratio, so a "
-        "model can hold more and still cost less.[/dim]"
+        "model can hold more and still cost less. Service is the share of periods "
+        "that did not stock out — the figure the target quantile promises; fill "
+        "rate is the share of units served, always higher.[/dim]"
     )
+
+
+CALIBRATION_TOLERANCE = 0.05
 
 
 def render_calibration(summary: pl.DataFrame, target: float) -> None:
-    """Whether stocking to a quantile actually achieves that service level.
+    """Whether stocking to a quantile achieves that quantile's service level.
 
-    This is the check that makes the rest trustworthy. A model whose 90th
-    percentile serves 70% of demand is not merely inaccurate — its stock levels
-    are wrong in a direction no accuracy metric reports.
+    Measured on cycle service level — the share of periods that did not stock out
+    — because that is what a quantile promises. Fill rate is not the right
+    comparison and reads as miscalibration when nothing is wrong: a period that
+    stocks out still serves most of its units, so a correct 90th percentile
+    normally shows a fill rate in the high nineties.
+
+    The tolerance is loose on purpose. A proportion estimated from a few hundred
+    series carries a couple of points of sampling error, so a tighter band would
+    flag noise as a defect.
     """
     off = summary.filter(
-        pl.col("fill_rate").is_not_null() & ((pl.col("fill_rate") - target).abs() > 0.05)
+        pl.col("cycle_service_level").is_not_null()
+        & ((pl.col("cycle_service_level") - target).abs() > CALIBRATION_TOLERANCE)
     )
     if off.is_empty():
         console.print(
-            f"   [green]calibration ok[/green] — every model's fill rate is within "
-            f"5 points of the {target:.0%} target"
+            f"   [green]calibration ok[/green] — every model's cycle service level is "
+            f"within {CALIBRATION_TOLERANCE:.0%} of the {target:.0%} target "
+            "(fill rate sits higher by construction, and is not the check)"
         )
         return
     console.print(
         f"   [yellow]calibration warning[/yellow] — stocking to the {target:.0%} "
-        "quantile did not deliver that fill rate:"
+        "quantile did not deliver that share of stockout-free periods:"
     )
     for row in off.sort("model").iter_rows(named=True):
-        gap = row["fill_rate"] - target
+        gap = row["cycle_service_level"] - target
         console.print(
-            f"     {row['model']}: {row['fill_rate']:.1%} "
+            f"     {row['model']}: {row['cycle_service_level']:.1%} "
             f"({gap:+.1%} vs target) — its intervals are "
-            + ("too wide" if gap > 0 else "too narrow")
+            + ("too wide, so it over-stocks" if gap > 0 else "too narrow, so it under-stocks")
         )
 
 
@@ -97,7 +116,7 @@ def render_by_scope(summary: pl.DataFrame, scope_column: str, baseline: str) -> 
     table.add_column(scope_column.replace("_", " ").title())
     table.add_column("Best model")
     table.add_column("Decision cost", justify="right")
-    table.add_column("Fill rate", justify="right")
+    table.add_column("Service", justify="right")
     table.add_column("DVA", justify="right")
 
     for scope in summary[scope_column].unique().sort():
@@ -107,7 +126,7 @@ def render_by_scope(summary: pl.DataFrame, scope_column: str, baseline: str) -> 
             str(scope),
             f"[bold]{best['model']}[/bold]",
             _fmt(best["decision_cost"], 0),
-            "-" if best["fill_rate"] is None else f"{best['fill_rate']:.1%}",
+            _pct(best.get("cycle_service_level")),
             _dva_cell(best.get("dva_pct")),
         )
     console.print(table)
@@ -148,3 +167,29 @@ def render_coverage(gap: pl.DataFrame, total_series: int, covered: int) -> None:
         "Arbitration selects on accuracy and does not yet know that a model "
         "without quantiles cannot support a decision.[/dim]"
     )
+
+
+def render_calibration_effect(before: pl.DataFrame, after: pl.DataFrame, target: float) -> None:
+    """What the conformal correction moved, per model.
+
+    Printed rather than assumed: a correction fitted on earlier origins can
+    overshoot on a later one, and the only way to know is to look.
+    """
+    table = Table(title=f"Quantile calibration — coverage of the {target:.0%} level")
+    table.add_column("Model")
+    table.add_column("Raw", justify="right")
+    table.add_column("Calibrated", justify="right")
+    table.add_column("Gap to target", justify="right")
+
+    raw = {r["model"]: r["coverage"] for r in before.iter_rows(named=True)}
+    fixed = {r["model"]: r["coverage"] for r in after.iter_rows(named=True)}
+    for model in sorted(raw):
+        gap_before, gap_after = abs(raw[model] - target), abs(fixed[model] - target)
+        arrow = "green" if gap_after < gap_before else "red" if gap_after > gap_before else "white"
+        table.add_row(
+            model,
+            _pct(raw[model]),
+            _pct(fixed[model]),
+            f"[{arrow}]{gap_before:.1%} -> {gap_after:.1%}[/{arrow}]",
+        )
+    console.print(table)

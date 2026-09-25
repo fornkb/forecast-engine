@@ -182,6 +182,18 @@ CREATE TABLE IF NOT EXISTS decision_policy (
     reorder_point   DOUBLE
 );
 
+-- Per model and level, how far its quantile has to move to cover demand as
+-- often as it claims. Stored rather than recomputed so a forecast can say which
+-- calibration it was built with, and so the offsets are auditable.
+CREATE TABLE IF NOT EXISTS quantile_calibration (
+    run_id        BIGINT NOT NULL,
+    client_id     VARCHAR NOT NULL,
+    model         VARCHAR NOT NULL,
+    level         DOUBLE NOT NULL,
+    scaled_offset DOUBLE NOT NULL,
+    n_obs         BIGINT
+);
+
 CREATE TABLE IF NOT EXISTS pattern_validation (
     run_id        BIGINT NOT NULL,
     ground_truth  VARCHAR,
@@ -627,4 +639,28 @@ class EngineStore:
         with self.connect() as con:
             return con.execute(
                 "SELECT * FROM decision_policy WHERE run_id = ? ORDER BY series_id", [run_id]
+            ).pl()
+
+    # ------------------------------------------------------- quantile calibration
+
+    def write_quantile_calibration(self, run_id: int, offsets: pl.DataFrame) -> None:
+        if offsets.is_empty():
+            return
+        frame = offsets.with_columns(
+            pl.lit(run_id, dtype=pl.Int64).alias("run_id"),
+            pl.lit(self.client_id).alias("client_id"),
+            pl.col("n_obs").cast(pl.Int64),
+        ).select("run_id", "client_id", "model", "level", "scaled_offset", "n_obs")
+        with self.connect() as con:
+            con.register("incoming_qc", frame)
+            con.execute("INSERT INTO quantile_calibration BY NAME SELECT * FROM incoming_qc")
+
+    def load_quantile_calibration(self, run_id: int) -> pl.DataFrame:
+        if not self.table_exists("quantile_calibration"):
+            return pl.DataFrame()
+        with self.connect() as con:
+            return con.execute(
+                "SELECT model, level, scaled_offset, n_obs FROM quantile_calibration "
+                "WHERE run_id = ? ORDER BY model, level",
+                [run_id],
             ).pl()

@@ -45,12 +45,17 @@ def with_decision_costs(scored: pl.DataFrame, cost_model: CostModelConfig) -> pl
 
 
 def aggregate(costed: pl.DataFrame, group_by: list[str]) -> pl.DataFrame:
-    """Total the decision costs, plus the service level actually achieved.
+    """Total the decision costs, plus two different service measures.
 
-    Achieved fill rate is the check on the whole exercise: a model stocking to its
-    own 90th percentile should serve about 90% of demand. One that does not is
-    miscalibrated, and its stock levels will be wrong in a way no accuracy metric
-    reports.
+    `cycle_service_level` is the share of periods in which stock covered demand.
+    That is what stocking to a quantile promises, so it is the calibration check:
+    stock to the 90th percentile and 90% of periods should not stock out.
+
+    `fill_rate` is the share of demanded *units* that were served. It is always
+    the higher of the two and is not a calibration check — in a period that does
+    stock out you still serve most of the units, so a well-calibrated 90th
+    percentile typically delivers a fill rate in the high nineties. It is here
+    because it is the number a planner quotes, not because it validates anything.
     """
     return (
         costed.group_by(group_by)
@@ -61,6 +66,7 @@ def aggregate(costed: pl.DataFrame, group_by: list[str]) -> pl.DataFrame:
             pl.col("units_held").sum().alias("units_held"),
             pl.col("units_short").sum().alias("units_short"),
             pl.col("actual").sum().alias("total_demand"),
+            (pl.col("actual") <= pl.col("value")).mean().alias("cycle_service_level"),
             pl.len().alias("n_obs"),
         )
         .with_columns(
@@ -120,6 +126,7 @@ def to_long(summary: pl.DataFrame, scope_type: str, scope_column: str | None) ->
         "shortage_cost",
         "units_held",
         "units_short",
+        "cycle_service_level",
         "fill_rate",
         "cost_per_unit_demand",
         "dva_pct",

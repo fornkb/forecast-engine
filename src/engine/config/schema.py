@@ -218,6 +218,13 @@ class ProbabilisticConfig(StrictModel):
 
     enabled: bool = True
     levels: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
+    # Correct each model's quantiles by how far they actually sat from the demand
+    # they claimed to cover, measured on the backtest's non-holdout origins.
+    # Halves the coverage error on this panel; costs about nothing either way,
+    # because the newsvendor cost curve is flat near its optimum. On for the
+    # honesty of the number rather than for the saving: a target_stock derived
+    # from an under-covering p90 under-delivers the service level it is sold as.
+    calibrate: bool = True
 
     @field_validator("levels")
     @classmethod

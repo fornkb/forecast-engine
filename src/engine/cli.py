@@ -33,6 +33,7 @@ from engine.features.pattern import (
     validate_against_labels,
 )
 from engine.features.segments import assign_volume_segments, segment_summary
+from engine.forecast import calibration
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.ingest import IngestError, get_reader, read_exogenous
@@ -269,6 +270,15 @@ def backtest(
         store.write_backtest_quantiles(run_id, predictions, profile.probabilistic.levels)
         scoreboard.persist(store, run_id, result)
 
+        if profile.probabilistic.enabled and profile.probabilistic.calibrate:
+            # Fitted on the earlier origins only. The final one stays untouched so
+            # the coverage reported against it is not coverage of its own fit.
+            stored = store.load_backtest_quantiles(run_id)
+            offsets = calibration.fit_offsets(
+                stored, profiles, exclude_origin=int(stored["origin"].max())
+            )
+            store.write_quantile_calibration(run_id, offsets)
+
     console.print(
         "   default model per "
         + f"{profile.models.arbitration.stratify_by}: "
@@ -433,6 +443,30 @@ def forecast(
     cutoff = fact["period"].max()
     final = final.with_columns(pl.lit(cutoff).cast(pl.Date).alias("cutoff_period"))
 
+    calibrated_from = None
+    if profile.probabilistic.enabled and profile.probabilistic.calibrate:
+        source_run = store.latest_run("backtest")
+        offsets = (
+            store.load_quantile_calibration(source_run)
+            if source_run is not None
+            else pl.DataFrame()
+        )
+        if offsets.is_empty():
+            console.print(
+                "[yellow]   probabilistic.calibrate is on but no calibration is stored — "
+                "run `engine backtest` to fit one. Quantiles are uncorrected.[/yellow]"
+            )
+        else:
+            # Corrected here, once, so the store, the export and the stock policy
+            # all read the same numbers rather than each remembering to ask.
+            final = calibration.apply_to_wide(
+                final,
+                offsets,
+                _ensure_profiles(store, profile, fact),
+                ctx.quantile_levels,
+            )
+            calibrated_from = source_run
+
     run_id = store.start_run("forecast", {"horizon": horizon, "models": models})
     store.write_forecasts(run_id, final)
     n_quantiles = store.write_forecast_quantiles(run_id, final, ctx.quantile_levels)
@@ -445,6 +479,11 @@ def forecast(
         console.print(
             f"   [green]{n_quantiles:,} quantile values[/green] at levels "
             f"{profile.probabilistic.levels}"
+            + (
+                f", calibrated from backtest run {calibrated_from}"
+                if calibrated_from is not None
+                else " (uncalibrated)"
+            )
         )
 
     if export is not None:
@@ -498,6 +537,20 @@ def decide(
     # earlier ones were used to arbitrate, so scoring on them flatters whichever
     # model the arbitration picked.
     holdout = scored.filter(pl.col("origin") == scored["origin"].max())
+
+    # The stored quantiles are raw. A forward forecast applies the calibration, so
+    # the decision reported here is the one the engine would actually take.
+    offsets = store.load_quantile_calibration(run_id)
+    if profile.probabilistic.calibrate and not offsets.is_empty():
+        raw = holdout
+        holdout = calibration.apply_offsets(
+            holdout, offsets, _ensure_profiles(store, profile, store.load_fact())
+        )
+        decide_report.render_calibration_effect(
+            calibration.coverage(raw, ["model"]),
+            calibration.coverage(holdout, ["model"]),
+            cost_model.service_level,
+        )
 
     with log_step(f"Costing {holdout.height:,} decisions from backtest run {run_id}"):
         costed = with_decision_costs(holdout, cost_model)
