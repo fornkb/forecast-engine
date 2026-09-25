@@ -40,6 +40,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 14. [What M5 changed](#14-what-m5-changed)
 15. [Reading from PostgreSQL](#15-reading-from-postgresql)
 16. [Publishing forecasts back](#16-publishing-forecasts-back)
+17. [The decision layer](#17-the-decision-layer)
 
 ---
 
@@ -367,7 +368,7 @@ with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 pytest
 ```
 
-Expected: **97 passed, 9 deselected** in roughly 15 seconds.
+Expected: **116 passed, 9 deselected** in roughly 13 seconds.
 
 For the full list of what each test checks:
 
@@ -487,6 +488,7 @@ Then re-run steps 1–3. Total: about 42 seconds.
 | `engine coldstart` | Accuracy vs. length of training history | `--client`, `--depths` |
 | `engine report` | Re-render a stored run | `--client`, `--run-id` |
 | `engine forecast` | Forecast forward from end of history | `--client`, `--horizon`, `--model`, `--export` |
+| `engine decide` | Score models on decision cost and set stock levels | `--client`, `--run-id` |
 | `engine publish` | Write a stored forecast into the ERP database | `--client`, `--run-id` |
 | `engine ui` | Browse the client's database in DuckDB's viewer, read-only | `--client`, `--port`, `--no-browser` |
 
@@ -597,8 +599,9 @@ src/engine/
   features/              Calendar features, panel construction, pattern profiling
   forecast/              Model portfolio and per-series arbitration
   evaluate/              Metrics, backtest, scoreboard
+  decide/                Inventory policy, decision cost, reporting
   cli.py                 Terminal interface
-tests/                   106 tests
+tests/                   125 tests
 ```
 
 ### The model portfolio
@@ -688,9 +691,15 @@ Stated plainly, so nothing here is mistaken for more than it is.
   yearly seasonality, and it limits how many origins can be backtested.
 - **Classifier thresholds were tuned on the labelled sample file** and need
   revalidation against real, unlabelled data.
-- **No decision layer.** Forecasts are quantities and quantiles. Safety stock,
-  reorder points and the cost of being wrong are not built, so the engine cannot
-  yet say what its accuracy is worth in money.
+- **Decision costs are not currency.** The cost model is a ratio, not rupees.
+  Teknic's source carries no prices, so the engine reports cost in the units the
+  ratio is expressed in and does not pretend otherwise. See
+  [section 17](#17-the-decision-layer).
+- **13.5% of the portfolio gets no stock policy.** Arbitration selects on
+  accuracy, and two of the enabled models produce no quantiles, so series whose
+  champion is one of them have no distribution to stock against. The engine
+  reports this rather than hiding it; fixing it means arbitration knowing that a
+  decision needs a distribution.
 - **Intermittent series remain hard.** A median series WAPE near 1.0 on that
   slice reflects the genuine difficulty of mostly-zero demand.
 - **Context features are supported but thin.** Exogenous signals are ingested
@@ -1147,3 +1156,148 @@ test with a plausible DSN will otherwise reach a live database.
   them is the ERP side of the work.
 - **No decision layer.** The published numbers are quantities and quantiles, not
   reorder points or safety stock. See [section 12](#12-scope-and-limits).
+
+---
+
+## 17. The decision layer
+
+Accuracy metrics treat over- and under-forecasting as equally bad. Inventory does
+not. A stockout and a month of holding are different amounts of pain, and their
+ratio is what decides how much stock to keep — so a model can be less accurate
+and still make better decisions.
+
+`engine decide` scores each model on what its stocking decisions cost, and turns
+the winning forecast into stock levels.
+
+### 17.1 The cost model
+
+```yaml
+cost_model:
+  holding_cost_per_unit: 1.0
+  shortage_cost_per_unit: 9.0
+  lead_time_periods: 1
+  review_period_periods: 1
+```
+
+The **ratio** is what matters, not the absolute numbers. 9:1 says a stockout
+hurts nine times as much as carrying a unit for a month, and the newsvendor
+critical ratio turns that into a service level:
+
+```
+service level = Cu / (Cu + Co) = 9 / (9 + 1) = 90%
+```
+
+That is the quantile at which one more unit costs exactly as much as one fewer.
+Choosing a target service level by hand is an implicit claim about this ratio,
+made without stating it; this way round, the claim is written down.
+
+**Units are not currency.** Teknic's source carries no prices, so the engine
+reports cost in whatever units the ratio is expressed in. It does not print a ₹
+sign it has not earned. Supplying real per-unit costs makes the same numbers
+monetary without any code change.
+
+**You can only stock to a quantile you forecast.** A 9:1 ratio needs `0.9` in
+`probabilistic.levels`. A 2:1 ratio implies 66.7%, which is not forecast, and the
+config is rejected with that spelled out — interpolating between the 50th and
+90th percentile would invent a distribution shape rather than report one a model
+produced.
+
+### 17.2 Running it
+
+```bash
+engine backtest --client teknic_mumbai_pg
+```
+
+```bash
+engine decide --client teknic_mumbai_pg
+```
+
+The backtest must be re-run first if it predates this layer: it always computed
+quantiles at each origin but only persisted the point forecast, and a decision is
+scored against the distribution available when it was made. The command says so
+rather than failing obscurely.
+
+### 17.3 How decision cost is measured
+
+A per-period newsvendor on held-out origins. At each origin the model's quantile
+at the critical ratio is the stock level, the actual is what showed up, holding
+cost falls on the excess and shortage cost on the shortfall.
+
+**Inventory carried between periods is deliberately not simulated.** Doing it
+needs an opening stock, an order calendar and receipt lags — none of which exist
+in the data, all of which would be invented. Because the carryover a model would
+face is the same whichever model produced the forecast, the comparison between
+models stays fair, which is the number worth having.
+
+One consequence is useful: under this reduction a perfect forecast costs exactly
+nothing, so **a model's decision cost is its regret** against perfect foresight.
+
+**Decision Value Add** is the share of the baseline's decision cost avoided — the
+money-shaped counterpart of FVA. It is computed within each segment, not globally,
+so Head items are compared against the baseline's Head cost.
+
+### 17.4 Measured on the Teknic panel
+
+| Model | Decision cost | Held | Short | Fill rate | DVA |
+| --- | --- | --- | --- | --- | --- |
+| `lightgbm_global` | 1,867,686 | 1,507,051 | 40,071 | 98.7% | **+21.2%** |
+| `seasonal_naive` | 2,370,937 | 1,574,977 | 88,440 | 97.0% | baseline |
+| `chronos2` | 2,421,259 | 1,820,284 | 66,775 | 97.8% | −2.1% |
+| `naive` | 3,197,545 | 2,747,095 | 50,050 | 98.3% | −34.9% |
+
+Two things worth reading off this. LightGBM avoids **21% of the baseline's
+decision cost**, consistently across Head, Mid and Tail. And **Chronos-2 costs
+more than the baseline** despite winning on accuracy for many individual series —
+its intervals are wide, so it over-stocks. Accuracy and decision quality are not
+the same ranking.
+
+### 17.5 Calibration is the check that makes the rest trustworthy
+
+A model stocking to its own 90th percentile should serve about 90% of demand. On
+the Teknic panel every model serves 97–99%, so every model's intervals are too
+wide and every model over-stocks. `engine decide` prints this as a warning.
+
+This is a real finding, not a rounding artefact: it means the p90s are too high,
+the portfolio holds more inventory than the configured service level asks for,
+and no accuracy metric reports it. Narrowing them is a model-layer fix that now
+has a number attached to it.
+
+### 17.6 Stock levels
+
+| Column | Meaning |
+| --- | --- |
+| `expected_demand` | Sum of point forecasts over the protection window |
+| `target_stock` | Order up to this at each review — the quantile over lead time + review period |
+| `safety_stock` | `target_stock` − `expected_demand`, floored at zero |
+| `reorder_point` | Trigger level for continuous review — the quantile over lead time alone |
+
+Both `target_stock` and `reorder_point` are reported because which policy a
+client runs is the client's business. Under periodic review only the first is
+used.
+
+**One known conservatism:** `target_stock` sums per-period quantiles, and for a
+service level above 50% the sum of quantiles exceeds the quantile of the sum. It
+therefore errs toward holding too much. Correcting it needs a joint distribution
+across horizons, which the models do not produce.
+
+### 17.7 What this exposed
+
+**40 of 297 series get no stock policy at all.** Arbitration picks a model on
+accuracy, and `auto_ets` and `croston` produce no quantiles — so a series whose
+champion is one of them has no distribution to stock against and never reaches a
+reorder screen. The engine reports the count and names the models.
+
+This is the decision layer earning its place before it has changed anything:
+it found a constraint the arbitration does not know about. Fixing it means either
+teaching those models to emit quantiles, or making arbitration prefer a model
+that can support a decision.
+
+### 17.8 What is not built
+
+- **Arbitration still selects on accuracy**, not on decision cost. Measuring
+  first was deliberate — now we know the two rankings disagree, and by how much.
+- **Decisions are not published.** `engine publish` writes forecasts, not stock
+  levels. Nothing in the ERP reads a reorder point yet.
+- **No carryover simulation.** See 17.3.
+- **One cost ratio for every item.** Real portfolios have cheap items and
+  critical ones; per-item costs would need a cost table as a new input.

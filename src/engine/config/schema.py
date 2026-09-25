@@ -15,6 +15,11 @@ Granularity = Literal["monthly", "weekly", "daily"]
 
 SEASONAL_PERIODS: dict[Granularity, int] = {"monthly": 12, "weekly": 52, "daily": 7}
 
+# A cost ratio rarely lands exactly on a configured level in floating point:
+# 9/(9+1) is 0.9 but 0.9 itself is not exact. Loose enough for that, tight
+# enough that 0.9 never matches a level of 0.95.
+SERVICE_LEVEL_TOLERANCE = 1e-9
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -327,6 +332,42 @@ class ModelsConfig(StrictModel):
         return value
 
 
+class CostModelConfig(StrictModel):
+    """What being wrong costs, and how long a decision is locked in for.
+
+    Costs are per unit, in whatever unit the client's costs are expressed in —
+    the engine never claims they are currency. Their *ratio* is what sets the
+    policy, so a client who knows only that a stockout hurts about nine times as
+    much as a month of holding can configure 1 and 9 and get the right answer.
+    """
+
+    holding_cost_per_unit: float = Field(default=1.0, gt=0)
+    shortage_cost_per_unit: float = Field(default=9.0, gt=0)
+    # Periods between placing an order and receiving it.
+    lead_time_periods: int = Field(default=1, ge=0)
+    # Periods between reorder opportunities. Together these set how long one
+    # decision has to cover.
+    review_period_periods: int = Field(default=1, ge=1)
+
+    @property
+    def service_level(self) -> float:
+        """The newsvendor critical ratio.
+
+        Cu / (Cu + Co) is the quantile at which the marginal cost of one more
+        unit equals the marginal cost of one fewer. Stocking to this quantile is
+        optimal; a target service level chosen by hand is an implicit claim about
+        this ratio, made without stating it.
+        """
+        return self.shortage_cost_per_unit / (
+            self.shortage_cost_per_unit + self.holding_cost_per_unit
+        )
+
+    @property
+    def protection_window(self) -> int:
+        """Periods one ordering decision has to cover."""
+        return self.lead_time_periods + self.review_period_periods
+
+
 class ClientProfile(StrictModel):
     client_id: str
     display_name: str
@@ -343,8 +384,8 @@ class ClientProfile(StrictModel):
     exogenous: ExogenousConfig = Field(default_factory=ExogenousConfig)
     probabilistic: ProbabilisticConfig = Field(default_factory=ProbabilisticConfig)
 
-    # Reserved for the decision layer so its arrival does not break this schema.
-    cost_model: None = None
+    # Absent means no decision layer for this client: forecasts only.
+    cost_model: CostModelConfig | None = None
 
     @field_validator("client_id")
     @classmethod
@@ -357,4 +398,27 @@ class ClientProfile(StrictModel):
         if self.models.baseline not in self.models.enabled:
             raise ValueError(
                 f"models.baseline {self.models.baseline!r} must also appear in models.enabled"
+            )
+        if self.cost_model is None:
+            return
+
+        # You can only stock to a quantile you actually forecast. Interpolating
+        # between the 50th and 90th percentile to reach a 70% service level would
+        # produce a number, and that number would be an assumption about the
+        # shape of the distribution rather than anything the model said.
+        target = self.cost_model.service_level
+        if not any(
+            abs(target - level) < SERVICE_LEVEL_TOLERANCE for level in self.probabilistic.levels
+        ):
+            raise ValueError(
+                f"cost_model implies a service level of {target:.4g} "
+                f"(shortage {self.cost_model.shortage_cost_per_unit:g} / "
+                f"holding {self.cost_model.holding_cost_per_unit:g}), but "
+                f"probabilistic.levels are {self.probabilistic.levels}. Add "
+                f"{target:.4g} to probabilistic.levels, or change the cost ratio "
+                "to one of the levels already forecast."
+            )
+        if not self.probabilistic.enabled:
+            raise ValueError(
+                "cost_model needs quantile forecasts, but probabilistic.enabled is false"
             )

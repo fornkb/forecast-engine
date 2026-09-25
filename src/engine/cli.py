@@ -20,6 +20,11 @@ import typer
 
 from engine.config import ClientProfile, ConfigError, list_clients, load_client
 from engine.config.schema import quantile_column
+from engine.decide import report as decide_report
+from engine.decide.cost import add_decision_value_add, with_decision_costs
+from engine.decide.cost import aggregate as decision_aggregate
+from engine.decide.cost import to_long as decision_to_long
+from engine.decide.policy import build_policy, coverage_gap
 from engine.evaluate import backtest as backtest_module
 from engine.evaluate import scoreboard
 from engine.features.pattern import (
@@ -259,6 +264,9 @@ def backtest(
             },
         )
         store.write_backtest_predictions(run_id, predictions)
+        # The decision layer scores a stock level chosen at each origin, so it
+        # needs the distribution the model produced there, not just the point.
+        store.write_backtest_quantiles(run_id, predictions, profile.probabilistic.levels)
         scoreboard.persist(store, run_id, result)
 
     console.print(
@@ -450,6 +458,105 @@ def forecast(
         "in the store; add --export forecasts.csv to get them as a file.[/dim]"
     )
     console.print(preview.select([c for c in preview_columns if c in preview.columns]))
+
+
+@app.command()
+def decide(
+    client: ClientOption,
+    run_id: Annotated[
+        int | None, typer.Option(help="Backtest run to score. Defaults to the latest.")
+    ] = None,
+) -> None:
+    """Score each model on what its stocking decisions cost, and set stock levels."""
+    profile, store = _load(client)
+    cost_model = profile.cost_model
+    if cost_model is None:
+        console.print(
+            f"[red]Client {client!r} has no cost_model block, so there is no cost to "
+            "measure against. Add one to the client profile.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    if run_id is None:
+        run_id = store.latest_run("backtest")
+        if run_id is None:
+            console.print("[red]No backtest run found. Run `engine backtest` first.[/red]")
+            raise typer.Exit(code=1)
+
+    decide_report.render_cost_model(cost_model)
+
+    scored = store.load_backtest_quantiles(run_id, level=cost_model.service_level)
+    if scored.is_empty():
+        console.print(
+            f"[red]Backtest run {run_id} stored no quantiles at level "
+            f"{cost_model.service_level:.4g}. Re-run `engine backtest` — runs from "
+            "before the decision layer did not persist them.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    # Only the final origin, for the same reason accuracy is reported on it: the
+    # earlier ones were used to arbitrate, so scoring on them flatters whichever
+    # model the arbitration picked.
+    holdout = scored.filter(pl.col("origin") == scored["origin"].max())
+
+    with log_step(f"Costing {holdout.height:,} decisions from backtest run {run_id}"):
+        costed = with_decision_costs(holdout, cost_model)
+        overall = add_decision_value_add(
+            decision_aggregate(costed, ["model"]), profile.models.baseline
+        )
+        metrics = decision_to_long(overall, "holdout", None)
+
+        profiles = _ensure_profiles(store, profile, store.load_fact())
+        segments = profiles.select("series_id", "volume_segment")
+        by_segment = add_decision_value_add(
+            decision_aggregate(
+                costed.join(segments, on="series_id", how="left"),
+                ["model", "volume_segment"],
+            ),
+            profile.models.baseline,
+            "volume_segment",
+        )
+        metrics = pl.concat(
+            [metrics, decision_to_long(by_segment, "volume_segment", "volume_segment")]
+        )
+
+        decision_run = store.start_run(
+            "decision",
+            {
+                "backtest_run_id": run_id,
+                "service_level": cost_model.service_level,
+                "cost_model": cost_model.model_dump(),
+            },
+        )
+        store.write_decision_metrics(decision_run, metrics)
+
+    decide_report.render_decision_cost(overall, profile.models.baseline)
+    decide_report.render_calibration(overall, cost_model.service_level)
+    decide_report.render_by_scope(by_segment, "volume_segment", profile.models.baseline)
+
+    forecast_run = store.latest_run("forecast")
+    if forecast_run is None:
+        console.print(
+            "\n   [yellow]no forecast run yet — run `engine forecast` to get stock "
+            "levels for the coming periods[/yellow]"
+        )
+        return
+
+    forward = store.load_forecasts(forecast_run)
+    policy = build_policy(forward, store.load_forecast_quantiles(forecast_run), cost_model)
+    store.write_decision_policy(decision_run, policy)
+    console.print()
+    decide_report.render_coverage(
+        coverage_gap(forward, policy),
+        forward["series_id"].n_unique(),
+        policy["series_id"].n_unique(),
+    )
+    decide_report.render_policy(policy, PREVIEW_ROWS)
+    console.print(
+        f"   [dim]run {decision_run}, from forecast run {forecast_run}. "
+        "Target stock covers the protection window; summing per-period quantiles "
+        "makes it slightly conservative.[/dim]"
+    )
 
 
 @app.command()

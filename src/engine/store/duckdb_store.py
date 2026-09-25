@@ -140,6 +140,48 @@ CREATE TABLE IF NOT EXISTS forecast_quantiles (
     value     DOUBLE
 );
 
+-- The backtest computed these all along but only kept the point forecast, which
+-- is enough to score accuracy and not enough to score a decision: choosing a
+-- stock level needs the distribution at the origin the decision was made from.
+CREATE TABLE IF NOT EXISTS backtest_quantiles (
+    run_id        BIGINT NOT NULL,
+    model         VARCHAR NOT NULL,
+    origin        INTEGER NOT NULL,
+    cutoff_period DATE NOT NULL,
+    series_id     VARCHAR NOT NULL,
+    period        DATE NOT NULL,
+    horizon       INTEGER NOT NULL,
+    level         DOUBLE NOT NULL,
+    actual        DOUBLE,
+    value         DOUBLE
+);
+
+-- Long, like backtest_metrics: one row per model per scope per metric, so a new
+-- decision metric is a row rather than a column.
+CREATE TABLE IF NOT EXISTS decision_metrics (
+    run_id      BIGINT NOT NULL,
+    model       VARCHAR NOT NULL,
+    scope_type  VARCHAR NOT NULL,
+    scope_value VARCHAR NOT NULL,
+    metric      VARCHAR NOT NULL,
+    value       DOUBLE,
+    n_obs       BIGINT
+);
+
+-- What to actually do, per item: the numbers an ERP's reorder screen needs.
+CREATE TABLE IF NOT EXISTS decision_policy (
+    run_id          BIGINT NOT NULL,
+    client_id       VARCHAR NOT NULL,
+    series_id       VARCHAR NOT NULL,
+    model           VARCHAR NOT NULL,
+    service_level   DOUBLE NOT NULL,
+    window_periods  INTEGER NOT NULL,
+    expected_demand DOUBLE,
+    target_stock    DOUBLE,
+    safety_stock    DOUBLE,
+    reorder_point   DOUBLE
+);
+
 CREATE TABLE IF NOT EXISTS pattern_validation (
     run_id        BIGINT NOT NULL,
     ground_truth  VARCHAR,
@@ -373,6 +415,70 @@ class EngineStore:
             con.register("incoming_preds", frame)
             con.execute("INSERT INTO backtest_predictions BY NAME SELECT * FROM incoming_preds")
 
+    def write_backtest_quantiles(
+        self, run_id: int, predictions: pl.DataFrame, levels: list[float]
+    ) -> int:
+        """Persist each origin's quantiles beside the actual they are scored on.
+
+        `actual` is carried here rather than joined back later: a decision is
+        judged against what happened in the period it was made for, and keeping
+        them in one row means that pairing cannot drift.
+        """
+        present = [(level, quantile_column(level)) for level in levels]
+        present = [(level, name) for level, name in present if name in predictions.columns]
+        if not present:
+            return 0
+
+        frame = (
+            predictions.select(
+                "model",
+                "origin",
+                "cutoff_period",
+                "series_id",
+                "period",
+                "horizon",
+                "actual",
+                *[pl.col(name).alias(str(level)) for level, name in present],
+            )
+            .unpivot(
+                index=[
+                    "model",
+                    "origin",
+                    "cutoff_period",
+                    "series_id",
+                    "period",
+                    "horizon",
+                    "actual",
+                ],
+                on=[str(level) for level, _ in present],
+                variable_name="level",
+                value_name="value",
+            )
+            .with_columns(
+                pl.lit(run_id, dtype=pl.Int64).alias("run_id"),
+                pl.col("level").cast(pl.Float64),
+            )
+            .drop_nulls("value")
+        )
+
+        with self.connect() as con:
+            con.register("incoming_bq", frame)
+            con.execute("INSERT INTO backtest_quantiles BY NAME SELECT * FROM incoming_bq")
+        return frame.height
+
+    def load_backtest_quantiles(self, run_id: int, level: float | None = None) -> pl.DataFrame:
+        # A store written before the decision layer existed has no such table.
+        # Empty is the honest answer, and the caller's message says to re-run.
+        if not self.table_exists("backtest_quantiles"):
+            return pl.DataFrame()
+        sql = "SELECT * FROM backtest_quantiles WHERE run_id = ?"
+        params: list[object] = [run_id]
+        if level is not None:
+            sql += " AND level = ?"
+            params.append(level)
+        with self.connect() as con:
+            return con.execute(sql + " ORDER BY series_id, period, level", params).pl()
+
     def load_backtest_predictions(self, run_id: int) -> pl.DataFrame:
         with self.connect() as con:
             return con.execute("SELECT * FROM backtest_predictions WHERE run_id = ?", [run_id]).pl()
@@ -481,4 +587,44 @@ class EngineStore:
         with self.connect() as con:
             return con.execute(
                 "SELECT * FROM forecasts WHERE run_id = ? ORDER BY series_id, period", [run_id]
+            ).pl()
+
+    # --------------------------------------------------------------- decisions
+
+    def write_decision_metrics(self, run_id: int, metrics: pl.DataFrame) -> None:
+        frame = metrics.with_columns(pl.lit(run_id, dtype=pl.Int64).alias("run_id")).select(
+            "run_id", "model", "scope_type", "scope_value", "metric", "value", "n_obs"
+        )
+        with self.connect() as con:
+            con.register("incoming_dm", frame)
+            con.execute("INSERT INTO decision_metrics BY NAME SELECT * FROM incoming_dm")
+
+    def load_decision_metrics(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute("SELECT * FROM decision_metrics WHERE run_id = ?", [run_id]).pl()
+
+    def write_decision_policy(self, run_id: int, policy: pl.DataFrame) -> None:
+        frame = policy.with_columns(
+            pl.lit(run_id, dtype=pl.Int64).alias("run_id"),
+            pl.lit(self.client_id).alias("client_id"),
+        ).select(
+            "run_id",
+            "client_id",
+            "series_id",
+            "model",
+            "service_level",
+            "window_periods",
+            "expected_demand",
+            "target_stock",
+            "safety_stock",
+            "reorder_point",
+        )
+        with self.connect() as con:
+            con.register("incoming_dp", frame)
+            con.execute("INSERT INTO decision_policy BY NAME SELECT * FROM incoming_dp")
+
+    def load_decision_policy(self, run_id: int) -> pl.DataFrame:
+        with self.connect() as con:
+            return con.execute(
+                "SELECT * FROM decision_policy WHERE run_id = ? ORDER BY series_id", [run_id]
             ).pl()

@@ -83,4 +83,13 @@ exogenous:
 probabilistic:
   enabled: true
   levels: [0.1, 0.5, 0.9]
-cost_model: null
+cost_model:
+  # A stockout is assumed to hurt nine times as much as carrying a unit for a
+  # month. That ratio is what sets the policy: 9/(9+1) means stock to the 90th
+  # percentile, which is why 0.9 has to be in probabilistic.levels above.
+  # The units are abstract — this client's source carries no prices, so nothing
+  # here is currency and the engine does not pretend otherwise.
+  holding_cost_per_unit: 1.0
+  shortage_cost_per_unit: 9.0
+  lead_time_periods: 1
+  review_period_periods: 1
