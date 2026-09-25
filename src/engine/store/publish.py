@@ -23,6 +23,8 @@ from engine.store.duckdb_store import EngineStore
 FORECAST_TABLE = "demand_forecast"
 QUANTILE_TABLE = "demand_forecast_quantile"
 RUN_TABLE = "forecast_run"
+POLICY_TABLE = "stock_policy"
+POLICY_RUN_TABLE = "policy_run"
 
 FORECAST_COLUMNS = [
     "run_id",
@@ -33,6 +35,18 @@ FORECAST_COLUMNS = [
     "horizon",
     "model",
     "forecast",
+]
+POLICY_COLUMNS = [
+    "run_id",
+    "client_id",
+    "series_id",
+    "model",
+    "service_level",
+    "window_periods",
+    "expected_demand",
+    "target_stock",
+    "safety_stock",
+    "reorder_point",
 ]
 QUANTILE_COLUMNS = [
     "run_id",
@@ -48,6 +62,15 @@ QUANTILE_COLUMNS = [
 
 class PublishError(RuntimeError):
     """Raised when a forecast cannot be written to the target database."""
+
+
+@dataclass(frozen=True)
+class PolicyReport:
+    run_id: int
+    target: str
+    series_count: int
+    service_level: float
+    window_periods: int
 
 
 @dataclass(frozen=True)
@@ -162,4 +185,76 @@ def publish_forecasts(store: EngineStore, client: ClientProfile, run_id: int) ->
         series_count=forecasts["series_id"].n_unique(),
         cutoff_period=str(cutoff),
         horizon=int(forecasts["horizon"].max()),
+    )
+
+
+def publish_policy(
+    store: EngineStore, client: ClientProfile, run_id: int, forecast_run_id: int
+) -> PolicyReport:
+    """Copy one decision run's stock levels into the ERP-readable output schema.
+
+    Published beside the forecast they came from, and carrying its id, so an ERP
+    reading a reorder point can tell which forecast produced it. Same transaction
+    discipline as the forecast: one commit, and republishing replaces.
+    """
+    config = client.output.postgres
+    if config is None:
+        raise PublishError(
+            f"Client {client.client_id} has no output.postgres block, so there is "
+            "nowhere to publish to. Add one to the client profile."
+        )
+
+    dsn = os.environ.get(config.dsn_env)
+    if not dsn:
+        raise PublishError(
+            f"Environment variable {config.dsn_env} is not set, so there is no "
+            "connection to the output database."
+        )
+
+    policy = store.load_decision_policy(run_id)
+    if policy.is_empty():
+        raise PublishError(
+            f"Decision run {run_id} has no stock policy in the store. Run `engine decide` first."
+        )
+
+    schema = config.target_schema
+    summary = pl.DataFrame(
+        {
+            "run_id": [run_id],
+            "client_id": [client.client_id],
+            "forecast_run_id": [forecast_run_id],
+            "service_level": [float(policy["service_level"].max())],
+            "window_periods": [int(policy["window_periods"].max())],
+            "series_count": [policy["series_id"].n_unique()],
+        }
+    ).with_columns(
+        pl.col("run_id").cast(pl.Int64),
+        pl.col("forecast_run_id").cast(pl.Int64),
+        pl.col("window_periods").cast(pl.Int32),
+        pl.col("series_count").cast(pl.Int32),
+    )
+
+    try:
+        with _connect(dsn) as conn, conn.cursor() as cursor:
+            for table in (POLICY_TABLE, POLICY_RUN_TABLE):
+                cursor.execute(
+                    f"DELETE FROM {schema}.{table} WHERE client_id = $1 AND run_id = $2",
+                    (client.client_id, run_id),
+                )
+            _ingest(cursor, schema, POLICY_RUN_TABLE, summary, list(summary.columns))
+            _ingest(cursor, schema, POLICY_TABLE, policy, POLICY_COLUMNS)
+            conn.commit()
+    except PublishError:
+        raise
+    except Exception as exc:
+        raise PublishError(
+            f"Publishing stock policy {run_id} to {redact(dsn)} failed: {scrub(str(exc), dsn)}"
+        ) from None
+
+    return PolicyReport(
+        run_id=run_id,
+        target=f"{schema}.{POLICY_TABLE}",
+        series_count=policy["series_id"].n_unique(),
+        service_level=float(policy["service_level"].max()),
+        window_periods=int(policy["window_periods"].max()),
     )

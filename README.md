@@ -368,7 +368,7 @@ with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 pytest
 ```
 
-Expected: **133 passed, 9 deselected** in roughly 13 seconds.
+Expected: **144 passed, 13 deselected** in roughly 15 seconds.
 
 For the full list of what each test checks:
 
@@ -601,7 +601,7 @@ src/engine/
   evaluate/              Metrics, backtest, scoreboard
   decide/                Inventory policy, decision cost, reporting
   cli.py                 Terminal interface
-tests/                   142 tests
+tests/                   157 tests
 ```
 
 ### The model portfolio
@@ -695,11 +695,10 @@ Stated plainly, so nothing here is mistaken for more than it is.
   Teknic's source carries no prices, so the engine reports cost in the units the
   ratio is expressed in and does not pretend otherwise. See
   [section 17](#17-the-decision-layer).
-- **13.5% of the portfolio gets no stock policy.** Arbitration selects on
-  accuracy, and two of the enabled models produce no quantiles, so series whose
-  champion is one of them have no distribution to stock against. The engine
-  reports this rather than hiding it; fixing it means arbitration knowing that a
-  decision needs a distribution.
+- **Every item now gets a stock policy**, but only because `auto_ets` and
+  `croston` were given conformal intervals. A model added later without
+  quantiles would silently drop its series off the reorder screen again;
+  arbitration still does not know that a decision needs a distribution.
 - **Intermittent series remain hard.** A median series WAPE near 1.0 on that
   slice reflects the genuine difficulty of mostly-zero demand.
 - **Context features are supported but thin.** Exogenous signals are ingested
@@ -1112,8 +1111,10 @@ deliberate — a publish target should never be acquired by accident.
 | --- | --- |
 | `v_current_forecast` | **The live forecast.** What an ERP should read. |
 | `v_current_forecast_quantile` | Its quantiles, long form |
+| `v_current_stock_policy` | **What to reorder.** Target stock, safety stock and reorder point per item. |
 | `demand_forecast` | Every published run, for history and accuracy tracking |
 | `forecast_run` | One row per publish: cutoff, horizon, row count, timestamp |
+| `stock_policy`, `policy_run` | The same history for stock levels |
 
 "Current" is the most recently *published* run, not the highest run id —
 republishing an older run is a deliberate act and takes effect.
@@ -1149,13 +1150,26 @@ in `pg_hba.conf` to `scram-sha-256` and reload the server. The tests in this
 repo point at a closed port rather than localhost for the same reason: a unit
 test with a plausible DSN will otherwise reach a live database.
 
-### 16.7 What is still not built
+### 16.7 Stock levels are published too
 
-- **Nothing reads the forecast back.** No ERP screen, no reorder suggestion, no
+`engine publish` writes the forecast and then the stock policy derived from it —
+one command, because an ERP needs both. The policy published is the one built
+from *that* forecast, found by the `forecast_run_id` its decision run recorded,
+not whichever policy happens to be newest. `policy_run.forecast_run_id` carries
+the link into the database, so an ERP reading a reorder point can tell which
+forecast produced it.
+
+If no decision run exists for the forecast being published, the command says so
+and publishes the forecast alone rather than pairing a reorder point with a
+forecast it did not come from.
+
+### 16.8 What is still not built
+
+- **Nothing reads it back.** No ERP screen, no purchase-order suggestion, no
   accuracy tracking against what actually sold. The rows are there; consuming
   them is the ERP side of the work.
-- **No decision layer.** The published numbers are quantities and quantiles, not
-  reorder points or safety stock. See [section 12](#12-scope-and-limits).
+- **No currency.** The published numbers are quantities. See
+  [section 17](#17-the-decision-layer).
 
 ---
 
@@ -1337,17 +1351,29 @@ service level above 50% the sum of quantiles exceeds the quantile of the sum. It
 therefore errs toward holding too much. Correcting it needs a joint distribution
 across horizons, which the models do not produce.
 
-### 17.7 What this exposed
+### 17.7 What this exposed, and what closing it found
 
-**40 of 297 series get no stock policy at all.** Arbitration picks a model on
-accuracy, and `auto_ets` and `croston` produce no quantiles — so a series whose
-champion is one of them has no distribution to stock against and never reaches a
-reorder screen. The engine reports the count and names the models.
+The decision layer's first finding was a hole nothing else had reported: **40 of
+297 series got no stock policy at all**. Arbitration picks a model on accuracy,
+and `auto_ets` and `croston` produced point forecasts only — so a series whose
+champion was one of them had no distribution to stock against and never reached
+a reorder screen.
 
-This is the decision layer earning its place before it has changed anything:
-it found a constraint the arbitration does not know about. Fixing it means either
-teaching those models to emit quantiles, or making arbitration prefer a model
-that can support a decision.
+Both now produce **conformal prediction intervals** via statsforecast, so all 297
+items get a policy. Conformal rather than each model's own analytic interval:
+they are distribution-free, they come out the same way for both, and Croston has
+no analytic interval to offer at all.
+
+Closing it turned up something else. Those two models were the **worst
+calibrated in the portfolio** — `auto_ets` at 82.9% and `croston` at 84.6%
+against a 90% target, well below anything else — and the calibration layer from
+17.5 brings them to 91.0% and 92.5%. Neither finding was reachable before the
+decision layer made coverage a thing worth measuring.
+
+The underlying constraint is still there: arbitration selects on accuracy and
+does not know that a decision needs a distribution. A model added later without
+quantiles would drop its series off the reorder screen again, and `engine decide`
+would report it.
 
 ### 17.8 What is not built
 
@@ -1356,8 +1382,9 @@ that can support a decision.
 - **Calibration is one offset per model and level**, not per segment or horizon.
   Coverage varies by only 1–3 points across origins and horizons on this panel,
   so a finer correction would fit noise; that may not hold on a larger portfolio.
-- **Decisions are not published.** `engine publish` writes forecasts, not stock
-  levels. Nothing in the ERP reads a reorder point yet.
+- **Nothing consumes the decisions.** `engine publish` now writes stock levels to
+  PostgreSQL (see [16.7](#167-stock-levels-are-published-too)), but no ERP screen
+  reads them and nothing turns a reorder point into a purchase order.
 - **No carryover simulation.** See 17.3.
 - **One cost ratio for every item.** Real portfolios have cheap items and
   critical ones; per-item costs would need a cost table as a new input.

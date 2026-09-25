@@ -120,23 +120,33 @@ def test_baselines_and_pooled_model_emit_usable_intervals(model, history, client
 def test_models_with_and_without_quantiles_combine_into_one_frame(history, client, series_meta):
     """Regression: `engine forecast` crashed when one model emitted quantiles and
     another did not — nulls appended afterwards land in a different column
-    position, and a vertical concat matches by position, not by name."""
+    position, and a vertical concat matches by position, not by name.
+
+    The quantile-less side is built by hand rather than taken from a model that
+    happens not to produce quantiles. Every enabled model produces them now, and
+    a regression test should not stop exercising its own case the moment that
+    changes — which is what happened when croston learned to emit intervals.
+    """
     ctx = ForecastContext(client=client, series_meta=series_meta)
     quantiles = ["q10", "q50", "q90"]
     columns = ["series_id", "period", "horizon", "model", "forecast"]
 
-    frames = [
-        conform(
-            get_forecaster(name).predict(history, 2, ctx).with_columns(pl.lit(name).alias("model")),
-            columns,
-            quantiles,
-        )
-        for name in ("croston", "seasonal_naive")  # croston emits no quantiles
-    ]
-    combined = pl.concat(frames)
+    with_quantiles = conform(
+        get_forecaster("seasonal_naive")
+        .predict(history, 2, ctx)
+        .with_columns(pl.lit("seasonal_naive").alias("model")),
+        columns,
+        quantiles,
+    )
+    without = conform(
+        with_quantiles.select(columns).with_columns(pl.lit("point_only").alias("model")),
+        columns,
+        quantiles,
+    )
+    combined = pl.concat([without, with_quantiles])
 
     assert combined.columns == columns + quantiles
-    assert combined.filter(pl.col("model") == "croston")["q10"].is_null().all()
+    assert combined.filter(pl.col("model") == "point_only")["q10"].is_null().all()
     assert combined.filter(pl.col("model") == "seasonal_naive")["q10"].is_not_null().all()
 
 

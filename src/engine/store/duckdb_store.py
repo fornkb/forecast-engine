@@ -409,6 +409,23 @@ class EngineStore:
             row = con.execute("SELECT * FROM runs WHERE run_id = ?", [run_id]).pl()
         return row.to_dicts()[0] if not row.is_empty() else None
 
+    def latest_run_from(self, run_type: str, key: str, value: int) -> int | None:
+        """The most recent run of `run_type` whose config records `key` = `value`.
+
+        Lets a publish pair a stock policy with the forecast it was derived from,
+        rather than publishing whatever policy happens to be newest beside
+        whatever forecast happens to be newest.
+        """
+        if not self.table_exists("runs"):
+            return None
+        with self.connect() as con:
+            row = con.execute(
+                "SELECT run_id FROM runs WHERE client_id = ? AND run_type = ? "
+                "AND json_extract(config, ?) = ? ORDER BY run_id DESC LIMIT 1",
+                [self.client_id, run_type, f"$.{key}", value],
+            ).fetchone()
+        return int(row[0]) if row else None
+
     # --------------------------------------------------------------- backtest
 
     def write_backtest_predictions(self, run_id: int, predictions: pl.DataFrame) -> None:

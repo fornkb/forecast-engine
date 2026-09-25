@@ -144,3 +144,71 @@ def test_the_writer_role_cannot_reach_the_erp_schema(published):
         conn.cursor() as cur,
     ):
         cur.execute("SELECT 1 FROM erp.v_demand_history LIMIT 1")
+
+
+# --- stock policy write-back ----------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def published_policy(published):
+    """Publish the stock policy derived from the forecast `published` published."""
+    from engine.store import EngineStore, publish_policy
+
+    profile = load_client("teknic_mumbai_pg")
+    store = EngineStore(profile.client_id)
+    decision_run = store.latest_run_from("decision", "forecast_run_id", published.run_id)
+    if decision_run is None:
+        pytest.skip("no decision run built from the published forecast; run `engine decide`")
+    return publish_policy(store, profile, decision_run, published.run_id)
+
+
+def test_every_series_reaches_the_reorder_view(published_policy):
+    """The point of the whole layer: an item with no reorder point is an item
+    nobody reorders."""
+    rows, series = _query(
+        "SELECT count(*), count(DISTINCT series_id) "
+        "FROM forecast_output.v_current_stock_policy "
+        f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published_policy.run_id}"
+    )[0]
+    assert rows == series == published_policy.series_count
+
+
+def test_the_published_policy_names_the_forecast_it_came_from(published_policy, published):
+    """Without the link nobody can tell whether a reorder point belongs to the
+    forecast published beside it."""
+    linked = _query(
+        "SELECT forecast_run_id FROM forecast_output.policy_run "
+        f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published_policy.run_id}"
+    )[0][0]
+    assert linked == published.run_id
+
+
+def test_stock_levels_are_ordered_and_non_negative(published_policy):
+    """target_stock covers lead time plus review, reorder_point covers lead time
+    alone, so one cannot exceed the other."""
+    bad = _query(
+        "SELECT count(*) FROM forecast_output.v_current_stock_policy "
+        f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published_policy.run_id} "
+        "AND (safety_stock < 0 OR reorder_point < 0 OR reorder_point > target_stock)"
+    )[0][0]
+    assert bad == 0
+
+
+def test_republishing_a_policy_replaces_rather_than_duplicates(published_policy):
+    from engine.store import EngineStore, publish_policy
+
+    profile = load_client("teknic_mumbai_pg")
+    again = publish_policy(
+        EngineStore(profile.client_id),
+        profile,
+        published_policy.run_id,
+        _query(
+            "SELECT forecast_run_id FROM forecast_output.policy_run "
+            f"WHERE run_id = {published_policy.run_id}"
+        )[0][0],
+    )
+    total = _query(
+        "SELECT count(*) FROM forecast_output.stock_policy "
+        f"WHERE client_id = 'teknic_mumbai_pg' AND run_id = {published_policy.run_id}"
+    )[0][0]
+    assert total == again.series_count == published_policy.series_count

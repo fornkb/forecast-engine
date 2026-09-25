@@ -37,7 +37,13 @@ from engine.forecast import calibration
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.ingest import IngestError, get_reader, read_exogenous
-from engine.store import EngineStore, PublishError, export_forecasts, publish_forecasts
+from engine.store import (
+    EngineStore,
+    PublishError,
+    export_forecasts,
+    publish_forecasts,
+    publish_policy,
+)
 from engine.store.export import SUPPORTED as EXPORT_FORMATS
 from engine.utils.console import console, log_step
 
@@ -573,10 +579,13 @@ def decide(
             [metrics, decision_to_long(by_segment, "volume_segment", "volume_segment")]
         )
 
+        # forecast_run_id is recorded so a publish can tell whether a stored
+        # policy belongs to the forecast it is publishing beside it.
         decision_run = store.start_run(
             "decision",
             {
                 "backtest_run_id": run_id,
+                "forecast_run_id": store.latest_run("forecast"),
                 "service_level": cost_model.service_level,
                 "cost_model": cost_model.model_dump(),
             },
@@ -645,6 +654,33 @@ def publish(
     console.print(
         "   [dim]the ERP reads forecast_output.v_current_forecast, which now "
         f"resolves to run {report.run_id}[/dim]"
+    )
+
+    # The policy published is the one derived from *this* forecast, not whichever
+    # is newest. Publishing a reorder point beside a forecast it was not built
+    # from would be worse than publishing no reorder point.
+    decision_run = store.latest_run_from("decision", "forecast_run_id", report.run_id)
+    if decision_run is None:
+        console.print(
+            "   [yellow]no stock policy published[/yellow] — run `engine decide` "
+            "after this forecast to publish reorder points beside it"
+        )
+        return
+
+    try:
+        with log_step(f"Publishing stock policy from decision run {decision_run}"):
+            policy = publish_policy(store, profile, decision_run, report.run_id)
+    except PublishError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"   [green]{policy.series_count} stock levels[/green] at a "
+        f"{policy.service_level:.0%} service level over {policy.window_periods} "
+        f"period(s) -> {policy.target}"
+    )
+    console.print(
+        "   [dim]the ERP reads forecast_output.v_current_stock_policy for what to reorder[/dim]"
     )
 
 
