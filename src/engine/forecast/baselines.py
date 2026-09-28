@@ -27,6 +27,36 @@ def _horizon_grid(history: pl.DataFrame, horizon: int, granularity: str) -> pl.D
     return pl.concat(frames)
 
 
+def _seasonal_lookup(grid: pl.DataFrame, period: int, granularity: str) -> pl.DataFrame:
+    """Point each target period at the most recent *observed* same-season value.
+
+    Stepping back exactly one seasonal cycle only works while the horizon stays
+    inside one. Past that the lookup lands after the forecast origin, finds
+    nothing, and the forecast silently degrades to the last observed value — so
+    from horizon 12 on a monthly client, seasonal-naive stopped being seasonal
+    and became plain naive. Since every Forecast Value Add figure is measured
+    against this model, that inflated every long-horizon result.
+
+    The fix is to reach back as many whole cycles as the horizon needs:
+    ceil(horizon / period). A series with too little history to cover that still
+    falls back to its last value, which is the documented behaviour for series
+    shorter than one cycle.
+    """
+    horizons = grid["horizon"].unique().to_list()
+    cycles = sorted({(horizon + period - 1) // period for horizon in horizons})
+
+    frames = []
+    for k in cycles:
+        lookback = k * period
+        frames.append(
+            grid.filter(((pl.col("horizon") + period - 1) // period) == k).with_columns(
+                offset_expr("period", -lookback, granularity).alias("lookup_period"),
+                pl.lit(lookback, dtype=pl.Int32).alias("lookback"),
+            )
+        )
+    return pl.concat(frames)
+
+
 def _last_values(history: pl.DataFrame) -> pl.DataFrame:
     return (
         history.sort("series_id", "period")
@@ -121,8 +151,9 @@ class SeasonalNaiveForecaster(Forecaster):
     def fit_predict(
         self, history: pl.DataFrame, horizon: int, ctx: ForecastContext
     ) -> pl.DataFrame:
-        grid = _horizon_grid(history, horizon, ctx.granularity).with_columns(
-            offset_expr("period", -ctx.seasonal_period, ctx.granularity).alias("lookup_period")
+        period = ctx.seasonal_period
+        grid = _seasonal_lookup(
+            _horizon_grid(history, horizon, ctx.granularity), period, ctx.granularity
         )
 
         seasonal = grid.join(
@@ -139,14 +170,23 @@ class SeasonalNaiveForecaster(Forecaster):
             "series_id",
             "period",
             "horizon",
+            "lookback",
             pl.coalesce("seasonal_value", "last_value").alias("forecast"),
         )
 
         levels = ctx.quantile_levels
         if not levels:
-            return point
+            return point.drop("lookback")
 
-        # Within one seasonal cycle the error of "same period last cycle" does
-        # not widen with the horizon, so a single spread per series suffices.
-        offsets = _residual_offsets(history, ctx.seasonal_period, levels)
-        return _with_quantiles(point, offsets, levels, ["series_id"])
+        # The spread is measured at the same distance the forecast reached back.
+        # Within one cycle that is the seasonal period and does not widen with the
+        # horizon; two cycles back it is a two-cycle error and does.
+        offsets = pl.concat(
+            [
+                _residual_offsets(history, lookback, levels).with_columns(
+                    pl.lit(lookback, dtype=pl.Int32).alias("lookback")
+                )
+                for lookback in sorted(point["lookback"].unique().to_list())
+            ]
+        )
+        return _with_quantiles(point, offsets, levels, ["series_id", "lookback"]).drop("lookback")

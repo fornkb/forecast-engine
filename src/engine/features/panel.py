@@ -14,8 +14,35 @@ import polars as pl
 from engine.config.schema import ExogenousConfig, Granularity
 from engine.features.calendar import CALENDAR_FEATURES, add_calendar_features, offset_expr
 
-DEFAULT_LAGS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 9, 12)
-DEFAULT_WINDOWS: tuple[int, ...] = (3, 6, 12)
+# Lags and rolling windows have to be expressed in the client's own periods.
+# A fixed set counted in "periods" means something different at every
+# granularity: (1..6, 9, 12) reaches back a year on a monthly panel and only
+# three months on a weekly one, which left weekly clients with no annual signal
+# at all while appearing to have a full lag set. Each granularity gets lags that
+# land on the distances that matter for it — recent periods, the sub-cycles a
+# planner reasons about, and one full seasonal cycle.
+LAGS_BY_GRANULARITY: dict[Granularity, tuple[int, ...]] = {
+    "daily": (1, 2, 3, 7, 14, 21, 28, 364),
+    "weekly": (1, 2, 3, 4, 8, 13, 26, 52),
+    "monthly": (1, 2, 3, 4, 5, 6, 9, 12),
+}
+WINDOWS_BY_GRANULARITY: dict[Granularity, tuple[int, ...]] = {
+    "daily": (7, 28, 364),
+    "weekly": (4, 13, 52),
+    "monthly": (3, 6, 12),
+}
+
+# Monthly remains the fallback for callers that do not state a granularity.
+DEFAULT_LAGS: tuple[int, ...] = LAGS_BY_GRANULARITY["monthly"]
+DEFAULT_WINDOWS: tuple[int, ...] = WINDOWS_BY_GRANULARITY["monthly"]
+
+
+def lags_for(granularity: Granularity) -> tuple[int, ...]:
+    return LAGS_BY_GRANULARITY[granularity]
+
+
+def windows_for(granularity: Granularity) -> tuple[int, ...]:
+    return WINDOWS_BY_GRANULARITY[granularity]
 
 
 def exogenous_columns(config: ExogenousConfig | None) -> list[str]:

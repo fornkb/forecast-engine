@@ -19,14 +19,14 @@ import polars as pl
 
 from engine.config.schema import quantile_column
 from engine.features.panel import (
-    DEFAULT_LAGS,
-    DEFAULT_WINDOWS,
     add_history_features,
     attach_exogenous,
     build_inference_frame,
     build_training_frame,
     encode_static_features,
     feature_columns,
+    lags_for,
+    windows_for,
 )
 from engine.forecast.base import ForecastContext, Forecaster, register_forecaster
 
@@ -46,10 +46,14 @@ class GlobalLightGBMForecaster(Forecaster):
         static_features = tuple(ctx.client.models.static_features)
         available = tuple(f for f in static_features if f in ctx.series_meta.columns)
         exog_config = ctx.client.exogenous
-        features = feature_columns(DEFAULT_LAGS, DEFAULT_WINDOWS, available, exog_config)
+        # Lags counted in the client's own periods, so a weekly panel reaches
+        # back a year rather than a quarter.
+        lags = lags_for(ctx.granularity)
+        windows = windows_for(ctx.granularity)
+        features = feature_columns(lags, windows, available, exog_config)
         categorical = [f"{column}_code" for column in available]
 
-        base = add_history_features(history, DEFAULT_LAGS, DEFAULT_WINDOWS)
+        base = add_history_features(history, lags, windows)
         static = encode_static_features(ctx.series_meta, available)
 
         settings = ctx.client.models.lightgbm

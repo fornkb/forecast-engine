@@ -22,6 +22,14 @@ _POLARS_FREQ: dict[Granularity, str] = {"monthly": "1mo", "weekly": "1w", "daily
 CONFORMAL_WINDOWS = 2
 
 
+# statsforecast needs 2h+1 observations per series to calibrate a conformal
+# interval over h steps, and refuses the whole call if any series is shorter.
+# At a three-month horizon nearly everything qualifies; at twelve months the
+# short and recently-launched series do not.
+def conformal_minimum(horizon: int) -> int:
+    return 2 * horizon + 1
+
+
 def interval_levels(quantile_levels: list[float]) -> tuple[list[int], dict[float, str]]:
     """Which statsforecast intervals to ask for, and how to read each quantile off them.
 
@@ -88,13 +96,57 @@ class StatsForecastAdapter(Forecaster):
         # champion produces no distribution has no stock level, so it never
         # reaches a reorder screen at all.
         levels, quantile_sources = interval_levels(ctx.quantile_levels)
-        interval_args: dict[str, Any] = {}
-        if levels:
-            interval_args = {
-                "level": levels,
-                "prediction_intervals": ConformalIntervals(h=horizon, n_windows=CONFORMAL_WINDOWS),
-            }
 
+        # Series too short to calibrate an interval are forecast separately, as
+        # points only. Asking for intervals on the whole panel would fail the
+        # entire run because of them, and dropping them would leave those items
+        # with no forecast at all — the reporting downstream already names series
+        # that reach a forecast without a distribution.
+        minimum = conformal_minimum(horizon)
+        sizes = panel.group_by("unique_id").len()
+        long_ids = sizes.filter(pl.col("len") >= minimum)["unique_id"]
+        short_ids = sizes.filter(pl.col("len") < minimum)["unique_id"]
+
+        frames: list[pl.DataFrame] = []
+        if levels and long_ids.len() > 0:
+            frames.append(
+                self._run(
+                    engine,
+                    panel.filter(pl.col("unique_id").is_in(long_ids)),
+                    horizon,
+                    ctx,
+                    quantile_sources,
+                    {
+                        "level": levels,
+                        "prediction_intervals": ConformalIntervals(
+                            h=horizon, n_windows=CONFORMAL_WINDOWS
+                        ),
+                    },
+                )
+            )
+        point_only = (
+            panel
+            if not levels or long_ids.len() == 0
+            else (
+                panel.filter(pl.col("unique_id").is_in(short_ids)) if short_ids.len() > 0 else None
+            )
+        )
+        if point_only is not None and point_only.height > 0:
+            frames.append(self._run(engine, point_only, horizon, ctx, {}, {}))
+
+        if len(frames) == 1:
+            return frames[0]
+        return conform_quantiles(frames, ctx.quantile_levels)
+
+    def _run(
+        self,
+        engine: StatsForecast,
+        panel: pl.DataFrame,
+        horizon: int,
+        ctx: ForecastContext,
+        quantile_sources: dict[float, str],
+        interval_args: dict[str, Any],
+    ) -> pl.DataFrame:
         predictions = engine.forecast(df=panel, h=horizon, **interval_args)
 
         # The point forecast is the column named for the model alone; the interval
@@ -154,3 +206,26 @@ class AutoARIMAForecaster(StatsForecastAdapter):
 
     def build_model(self, ctx: ForecastContext) -> Any:
         return AutoARIMA(season_length=ctx.seasonal_period)
+
+
+def conform_quantiles(frames: list[pl.DataFrame], levels: list[float]) -> pl.DataFrame:
+    """Stack point-only and interval-bearing frames into one shared schema.
+
+    A vertical concat matches columns by position, so a frame missing a quantile
+    column cannot simply be appended — the nulls would land in the wrong place.
+    Same reasoning as `conform` in forecast.base, applied within one model's own
+    output rather than across models.
+    """
+    names = [quantile_column(level) for level in levels]
+    base = ["series_id", "period", "horizon", "forecast"]
+    aligned = [
+        frame.with_columns(
+            [
+                pl.lit(None, dtype=pl.Float64).alias(name)
+                for name in names
+                if name not in frame.columns
+            ]
+        ).select(base + names)
+        for frame in frames
+    ]
+    return pl.concat(aligned)

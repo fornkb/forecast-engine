@@ -41,6 +41,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 15. [Reading from PostgreSQL](#15-reading-from-postgresql)
 16. [Publishing forecasts back](#16-publishing-forecasts-back)
 17. [The decision layer](#17-the-decision-layer)
+18. [Forecast horizons](#18-forecast-horizons)
 
 ---
 
@@ -368,7 +369,7 @@ with `winget install DuckDB.cli` (then `duckdb -ui <file>`).
 pytest
 ```
 
-Expected: **144 passed, 13 deselected** in roughly 15 seconds.
+Expected: **151 passed, 13 deselected** in roughly 15 seconds.
 
 For the full list of what each test checks:
 
@@ -601,7 +602,7 @@ src/engine/
   evaluate/              Metrics, backtest, scoreboard
   decide/                Inventory policy, decision cost, reporting
   cli.py                 Terminal interface
-tests/                   157 tests
+tests/                   164 tests
 ```
 
 ### The model portfolio
@@ -1388,3 +1389,96 @@ would report it.
 - **No carryover simulation.** See 17.3.
 - **One cost ratio for every item.** Real portfolios have cheap items and
   critical ones; per-item costs would need a cost table as a new input.
+
+---
+
+## 18. Forecast horizons
+
+`evaluation.horizon` is an unbounded integer, so a long horizon is a
+configuration change rather than a feature request. What follows is what actually
+constrains it, and two defects that only appeared once a long horizon was run.
+
+### 18.1 Accuracy decays, and the ranking changes with it
+
+Teknic, monthly, held-out origin:
+
+| Model | FVA at h=3 | FVA at h=12 |
+| --- | --- | --- |
+| **portfolio** | **+45.7%** | **+30.7%** |
+| `lightgbm_global` | +41.4% | +17.4% |
+| `chronos2` | +40.4% | +16.6% |
+| `croston` | +23.4% | **−2.5%** |
+| `auto_ets` | +15.5% | **−2.0%** |
+| `naive` | −42.8% | −26.0% |
+
+Two models cross from beating the baseline to losing to it. A single enabled
+model list cannot be right for both horizons, which is the argument for planning
+tiers with their own model sets rather than one list stretched.
+
+### 18.2 Seasonal-naive stopped being seasonal past one cycle
+
+The baseline looked back exactly one seasonal period. Past a horizon of one
+cycle that lookup lands after the forecast origin, finds nothing, and the
+forecast falls back to the last observed value — so from horizon 13 on a monthly
+client, `seasonal_naive` silently became `naive`.
+
+**Every Forecast Value Add figure is measured against this model**, and `naive`
+is a much weaker baseline (on Teknic, 43% worse), so every long-horizon result
+would have been inflated. Nothing caught it because no run had ever asked for a
+horizon past four periods.
+
+It now reaches back as many whole cycles as the horizon needs —
+`ceil(horizon / seasonal_period)` — and the interval spread is measured at the
+same distance, because a two-cycle-old observation is a worse predictor than a
+one-cycle-old one. At exactly one cycle `seasonal_naive` and `naive` coincide
+legitimately: one cycle back from horizon 12 is the last observed period.
+
+### 18.3 Lags were counted in bare periods
+
+`(1, 2, 3, 4, 5, 6, 9, 12)` reaches back a year on a monthly panel and only a
+quarter on a weekly one, so **weekly clients had no annual signal in the feature
+set at all** while appearing to have a full lag set. Lags and rolling windows are
+now derived from granularity:
+
+| Granularity | Lags | Windows |
+| --- | --- | --- |
+| `daily` | 1, 2, 3, 7, 14, 21, 28, 364 | 7, 28, 364 |
+| `weekly` | 1, 2, 3, 4, 8, 13, 26, 52 | 4, 13, 52 |
+| `monthly` | 1, 2, 3, 4, 5, 6, 9, 12 | 3, 6, 12 |
+
+Each set reaches at least one full seasonal cycle, and a test asserts it. This
+changes weekly results — M5 gains an annual lag it never had.
+
+### 18.4 What a horizon costs in history
+
+Two independent requirements, both in periods:
+
+| Requirement | Needs |
+| --- | --- |
+| A scoreable backtest | `min_train_periods + horizon + (origins − 1) × origin_step` |
+| Conformal intervals for `auto_ets` and `croston` | `2 × horizon + 1` per series, at every origin |
+
+The second is the binding one at long horizons. A 12-period horizon needs 25
+periods of training history; a 36-period horizon needs 73. Aggregating to a
+coarser granularity does not relax it in calendar terms — 25 quarters is about
+the same span as 73 months.
+
+Series or origins that fall short are forecast as points only rather than failing
+the run, and `engine decide` names the series that reach a forecast without a
+distribution. Before this, one short series aborted the entire backtest with a
+raw traceback.
+
+### 18.5 What is still missing for multi-horizon planning
+
+- **One granularity per client.** A client needing weekly execution and quarterly
+  S&OP needs two profiles, two stores, and has no guarantee the numbers agree.
+- **No temporal aggregation or reconciliation.** Nothing sums a weekly forecast
+  into the quarter it belongs to, so two tiers would quote different numbers for
+  the same period.
+- **Calibration is one offset per model and level**, not per horizon band, and
+  coverage degrades with horizon.
+- **Metrics are pointwise.** Strategic planning cares about cumulative volume
+  over the horizon, which per-period error does not measure.
+- **No `quarterly` or `yearly` granularity.**
+- **One decision object.** Reorder points suit execution; a strategic tier needs
+  a volume or capacity envelope instead.
