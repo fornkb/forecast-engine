@@ -20,6 +20,11 @@ layers belong to later phases.
 Every model is scored against a seasonal-naive baseline on a rolling-origin
 backtest, so added sophistication has to prove itself rather than be assumed.
 
+> **Setting it up for the first time?** [SETUP.md](SETUP.md) is a standalone
+> walkthrough from `git clone` to stock levels on screen, with nothing else to
+> read first. Sections 1–11 below cover the same ground in more depth, alongside
+> everything about how the engine works.
+
 ---
 
 ## Contents
