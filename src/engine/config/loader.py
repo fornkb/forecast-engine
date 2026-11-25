@@ -39,6 +39,7 @@ def load_client(client_id: str, config_dir: Path | None = None) -> ClientProfile
         raise ConfigError(
             f"client_id in {path} is {profile.client_id!r} but the file is named {client_id!r}"
         )
+    profile._profile_dir = path.resolve().parent
     return profile
 
 

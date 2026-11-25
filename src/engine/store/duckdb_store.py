@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from time import sleep
 from typing import Any
 
 import duckdb
@@ -210,6 +211,15 @@ MIGRATIONS = (
     "ALTER TABLE series_profile ADD COLUMN IF NOT EXISTS volume_segment VARCHAR",
 )
 
+_FORECAST_AVAILABILITY = """
+CREATE TABLE IF NOT EXISTS forecast_availability (
+    client_id VARCHAR NOT NULL,
+    run_id BIGINT NOT NULL,
+    available_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (client_id, run_id)
+)
+"""
+
 
 class EngineStore:
     """Thin, explicit persistence layer. All SQL lives here."""
@@ -223,7 +233,29 @@ class EngineStore:
 
     @contextmanager
     def connect(self):
-        con = duckdb.connect(str(self.path))
+        for attempt in range(4):
+            try:
+                con = duckdb.connect(str(self.path))
+                break
+            except duckdb.IOException as exc:
+                detail = str(exc).lower()
+                if not any(
+                    phrase in detail
+                    for phrase in (
+                        "could not set lock",
+                        "conflicting lock",
+                        "being used by another process",
+                        "sharing violation",
+                        "file is locked",
+                    )
+                ):
+                    raise
+                if attempt == 3:
+                    raise duckdb.IOException(
+                        f"Database {self.path} is busy. Retry after the other process closes "
+                        "its DuckDB connection."
+                    ) from exc
+                sleep(0.05 * 2**attempt)
         try:
             yield con
         finally:
@@ -566,7 +598,19 @@ class EngineStore:
         )
         with self.connect() as con:
             con.register("incoming_forecasts", frame)
-            con.execute("INSERT INTO forecasts BY NAME SELECT * FROM incoming_forecasts")
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(_FORECAST_AVAILABILITY)
+                con.execute("INSERT INTO forecasts BY NAME SELECT * FROM incoming_forecasts")
+                if frame.height:
+                    con.execute(
+                        "INSERT OR REPLACE INTO forecast_availability VALUES (?, ?, ?)",
+                        [self.client_id, run_id, datetime.now(UTC)],
+                    )
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
 
     def write_forecast_quantiles(
         self, run_id: int, forecasts: pl.DataFrame, levels: list[float]

@@ -7,9 +7,13 @@ to a default nobody intended.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
+
+from engine.config.base import StrictModel
+from engine.reason.config import ReasoningConfig
 
 Granularity = Literal["monthly", "weekly", "daily"]
 
@@ -19,10 +23,6 @@ SEASONAL_PERIODS: dict[Granularity, int] = {"monthly": 12, "weekly": 52, "daily"
 # 9/(9+1) is 0.9 but 0.9 itself is not exact. Loose enough for that, tight
 # enough that 0.9 never matches a level of 0.95.
 SERVICE_LEVEL_TOLERANCE = 1e-9
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class ColumnMap(StrictModel):
@@ -393,6 +393,12 @@ class ClientProfile(StrictModel):
 
     # Absent means no decision layer for this client: forecasts only.
     cost_model: CostModelConfig | None = None
+    reasoning: ReasoningConfig | None = None
+    _profile_dir: Path | None = PrivateAttr(default=None)
+
+    @property
+    def profile_dir(self) -> Path | None:
+        return self._profile_dir
 
     @field_validator("client_id")
     @classmethod
