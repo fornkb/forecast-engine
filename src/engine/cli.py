@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import socket
 import webbrowser
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -38,8 +37,7 @@ from engine.forecast import calibration
 from engine.forecast.arbitration import apply_selection
 from engine.forecast.base import ForecastContext, conform, get_forecaster
 from engine.ingest import IngestError, get_reader, read_exogenous
-from engine.reason.cli import collect_command, register_review_commands
-from engine.reason.cli import create_app as create_reason_context_app
+from engine.reason.cli import register_reason_commands
 from engine.store import (
     EngineStore,
     PublishError,
@@ -71,30 +69,7 @@ def _load(client_id: str) -> tuple[ClientProfile, EngineStore]:
     return client, EngineStore(client.client_id)
 
 
-app.add_typer(create_reason_context_app(lambda client: _load(client)), name="reason-context")
-register_review_commands(app, lambda client: _load(client))
-
-
-@app.command("reason-collect")
-def reason_collect(
-    client: ClientOption,
-    run_id: Annotated[int, typer.Option("--run-id", min=1)],
-    snapshot_id: Annotated[str | None, typer.Option("--snapshot-id")] = None,
-    resume_id: Annotated[str | None, typer.Option("--resume-id")] = None,
-    as_of: Annotated[
-        str | None, typer.Option("--as-of", help="ISO timestamp with UTC offset.")
-    ] = None,
-    as_json: Annotated[bool, typer.Option("--json")] = False,
-) -> None:
-    """Collect the base evidence for a saved monthly forecast."""
-    try:
-        cutoff = datetime.fromisoformat(as_of) if as_of is not None else None
-    except ValueError:
-        raise typer.BadParameter(
-            "Provide an ISO timestamp with a UTC offset", param_hint="--as-of"
-        ) from None
-    profile, store = _load(client)
-    collect_command(profile, store, run_id, snapshot_id, resume_id, cutoff, as_json)
+register_reason_commands(app, lambda client: _load(client))
 
 
 def _require_data(store: EngineStore) -> tuple[pl.DataFrame, pl.DataFrame]:

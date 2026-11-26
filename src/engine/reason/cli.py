@@ -1,481 +1,349 @@
-"""Operator commands for the saved forecast context."""
+"""`engine reason*` commands. Thin wrappers: the same functions serve a future ERP portal."""
 
 from __future__ import annotations
 
 import json
-from collections import Counter
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, date, datetime
 from enum import StrEnum
-from itertools import islice
 from pathlib import Path
 from typing import Annotated
 
 import typer
-from duckdb import Error as DatabaseError
-from pydantic import ValidationError
+from rich.console import Console
+from rich.table import Table
 
-from engine.config.schema import ClientProfile
-from engine.reason.admin import propose_clarification, resolve_review_question
-from engine.reason.collect import collect_evidence
-from engine.reason.context import load_forecast_snapshot
-from engine.reason.erp import require_reasoning
-from engine.reason.evaluation import evaluate_reviews
-from engine.reason.facts import sync_context
-from engine.reason.questions import confirm_question, list_questions
-from engine.reason.replay import replay_review
-from engine.reason.report import load_report, print_summary, render_markdown
-from engine.reason.review import load_review, run_review
-from engine.reason.schemas import (
-    AssumptionInput,
-    ContextError,
-    ContextSyncError,
-    ForecastSnapshot,
-    SyncResult,
+from engine.reason import store as records
+from engine.reason.llm import LLMError, get_client
+from engine.reason.llm.cost import cost
+from engine.reason.profile import (
+    apply_answers,
+    draft_profile,
+    load_profile,
+    profile_path,
+    save_profile,
 )
-from engine.store.duckdb_store import EngineStore
+from engine.reason.report import render_html, render_markdown, totals
+from engine.reason.run import (
+    Options,
+    apply_override,
+    recordings_path,
+    require_reasoning,
+    run_review,
+)
+from engine.reason.schemas import LLMCall, Override, ReasoningError, ReasonRun
 
+console = Console()
 ClientOption = Annotated[str, typer.Option("--client", "-c", help="Client profile id.")]
-PREVIEW_LIMIT = 8
 
 
-def collect_command(
-    profile: ClientProfile,
-    store: EngineStore,
-    run_id: int,
-    snapshot_id: str | None,
-    resume_id: str | None,
-    as_of: datetime | None,
-    as_json: bool,
-) -> None:
-    with _operator_errors():
-        batch = collect_evidence(
-            profile,
-            store,
-            run_id,
-            snapshot_id=snapshot_id,
-            resume_id=resume_id,
-            as_of=as_of,
-            on_start=lambda value: typer.echo(f"Collection ID {value}", err=True),
-        )
-    output = {
-        "batch_id": batch.batch_id,
-        "collection_id": batch.collection_id,
-        "snapshot_id": batch.snapshot_id,
-        "knowledge_cutoff": batch.knowledge_cutoff.isoformat(),
-        "complete": batch.complete,
-        "check_count": len(batch.check_ids),
-        "evidence_count": len(batch.evidence_ids),
-        "group_count": len(batch.groups),
-        "candidate_count": len(batch.candidates),
-        "gap_count": len(batch.gaps),
-        "gaps": list(batch.gaps[:PREVIEW_LIMIT]),
-        "status_counts": dict(batch.status_counts),
-        "usage": [item.model_dump(mode="json") for item in batch.usage],
+class LLMMode(StrEnum):
+    live = "live"
+    record = "record"
+    replay = "replay"
+
+
+class Action(StrEnum):
+    accept = "accept"
+    dismiss = "dismiss"
+    edit = "edit"
+
+
+def _fail(exc: Exception) -> typer.Exit:
+    console.print(f"[red]{exc}[/red]")
+    return typer.Exit(code=1)
+
+
+def print_run(run: ReasonRun) -> None:
+    used = totals(run)
+    status = {
+        "changed": "[green]changed[/green]",
+        "unchanged": "unchanged",
+        "no_data": "[yellow]no data[/yellow]",
+        "error": "[red]error[/red]",
     }
-    if as_json:
-        typer.echo(json.dumps(output))
-        return
-    typer.echo(f"Evidence batch {batch.batch_id}")
-    typer.echo(
-        f"{output['check_count']} checks, {output['evidence_count']} evidence revisions, "
-        f"{output['group_count']} exposure groups, {output['candidate_count']} news candidates"
-    )
-    for gap in output["gaps"]:
-        typer.echo(f"  {gap}")
-    if len(batch.gaps) > PREVIEW_LIMIT:
-        typer.echo(f"  {len(batch.gaps) - PREVIEW_LIMIT} more gaps in the saved batch")
-
-
-@contextmanager
-def _operator_errors() -> Iterator[None]:
-    try:
-        yield
-    except ContextSyncError as exc:
-        _print_sync(SyncResult(invalid=exc.invalid))
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
-    except (ContextError, DatabaseError) as exc:
-        typer.echo(str(exc), err=True)
-        raise typer.Exit(1) from exc
-
-
-def _print_sync(result: SyncResult) -> None:
-    typer.echo(" ".join(f"{key}={value}" for key, value in result.model_dump().items()))
-
-
-def _inspect(snapshot: ForecastSnapshot, series: str | None, as_json: bool) -> None:
-    matching = sum(1 for _ in snapshot.iter_rows(series))
-    gaps = tuple(gap for gap in snapshot.gaps if series is None or gap.series_id in (None, series))
-    counts = dict(sorted(Counter(gap.code for gap in gaps).items()))
-    units = sorted({row.unit for row in snapshot.iter_rows(series) if row.unit})
-    preview = list(islice(snapshot.iter_rows(series), PREVIEW_LIMIT))
-    if as_json:
-        output = snapshot.model_dump(mode="json", exclude={"rows", "gaps"})
-        output.update(
-            row_count=len(snapshot.rows),
-            matched_row_count=matching,
-            units=units,
-            gap_counts=counts,
-            gaps=[gap.model_dump(mode="json") for gap in gaps[:PREVIEW_LIMIT]],
-            preview=[row.model_dump(mode="json") for row in preview],
+    table = Table("Driver", "Status", "Signals", title=f"Drivers · run {run.reason_id}")
+    for state in run.drivers:
+        detail = "; ".join(
+            (s.summary if s.ok else f"{s.kind}: {s.error}")[:90] for s in state.signals
         )
-        typer.echo(json.dumps(output))
-        return
-
-    typer.echo(f"Snapshot {snapshot.snapshot_id} · forecast run {snapshot.forecast_run_id}")
-    target = (
-        f"{snapshot.target.id} — {snapshot.target.definition}" if snapshot.target else "unknown"
-    )
-    typer.echo(
-        f"Target {target} | Units {', '.join(units) or 'unknown'} "
-        f"| Rows {matching}/{len(snapshot.rows)}"
-    )
-    typer.echo("Gaps " + (", ".join(f"{code}={count}" for code, count in counts.items()) or "none"))
-    for gap in gaps[:PREVIEW_LIMIT]:
-        scope = f"{gap.series_id} {gap.period} · " if gap.series_id else ""
-        typer.echo(f"  {scope}{gap.message}")
-    typer.echo(f"First {len(preview)} of {matching} matching rows")
-    for row in preview:
-        typer.echo(
-            f"  {row.series_id}  {row.period}  h={row.horizon}  "
-            f"{row.model}  {row.baseline:g} {row.unit or ''}"
+        table.add_row(state.driver_id, status[state.status], detail or "–")
+    console.print(table)
+    if run.status == "dry_run":
+        estimate = run.estimate
+        console.print(
+            f"[bold]Dry run[/bold] · would make {estimate.get('calls', 0)} AI call(s) · "
+            f"~{estimate.get('input_tokens', 0):,} input tokens · cost guess "
+            f"{estimate.get('cost_guess') if estimate.get('cost_guess') is not None else 'unknown'}"
         )
+        return
+    table = Table(
+        "ID", "Driver", "Family", "Channel", "Effect", "Months", "Evidence", title="Findings"
+    )
+    for f in run.findings:
+        effect = "–" if f.low_pct == f.high_pct == 0 else f"{f.low_pct:+g}%..{f.high_pct:+g}%"
+        table.add_row(
+            f.finding_id,
+            f.driver_id,
+            f.family_id,
+            f.channel,
+            effect,
+            ", ".join(m.strftime("%Y-%m") for m in f.months),
+            f.tier + (" (carried)" if f.carried_from else ""),
+        )
+    console.print(table)
+    if run.summary:
+        console.print(f"[bold]Summary:[/bold] {run.summary}")
+    for gap in [*run.not_assessed, *run.gaps]:
+        console.print(f"[yellow]gap:[/yellow] {gap}")
+    cost = "unknown" if used["cost"] is None else f"{used['cost']:.4f} {used['currency']}"
+    console.print(
+        f"{run.status} · {used['calls']} AI call(s) · {used['input_tokens']:,} in / "
+        f"{used['output_tokens']:,} out tokens · cost {cost}"
+    )
 
 
-def create_app(load: Callable[[str], tuple[ClientProfile, EngineStore]]) -> typer.Typer:
-    app = typer.Typer(no_args_is_help=True, help="Inspect saved forecast and company context.")
-
-    @app.command()
-    def sync(client: ClientOption) -> None:
-        """Import configured company facts in one batch."""
-        with _operator_errors():
-            profile, store = load(client)
-            _print_sync(sync_context(profile, store))
-
-    @app.command()
-    def inspect(
-        client: ClientOption,
-        run_id: Annotated[int, typer.Option("--run-id", min=1)],
-        series: Annotated[
-            str | None, typer.Option("--series", help="Filter the preview by series ID.")
-        ] = None,
-        as_json: Annotated[
-            bool, typer.Option("--json", help="Print a machine-readable summary.")
-        ] = False,
-    ) -> None:
-        """Pin and inspect an explicit saved monthly forecast run."""
-        with _operator_errors():
-            profile, store = load(client)
-            _inspect(load_forecast_snapshot(profile, store, run_id), series, as_json)
-
-    @app.command()
-    def questions(client: ClientOption) -> None:
-        """List pending onboarding and conflict questions."""
-        with _operator_errors():
-            profile, store = load(client)
-            require_reasoning(profile)
-            pending = list_questions(store)
-            typer.echo(f"Pending questions {len(pending)}")
-            for question in pending:
-                spec = question.spec
-                months = ", ".join(month.isoformat() for month in spec.affected_months)
-                typer.echo(
-                    f"  {question.question_id} · {spec.subject.type} {spec.subject.id} "
-                    f"· {spec.message}"
-                )
-                typer.echo(
-                    f"    Answer type {spec.answer_type} | Target months {months or 'unspecified'}"
-                )
-                if question.answer:
-                    typer.echo(f"    Previous answer {question.answer.answer_id}")
-
-    @app.command()
-    def confirm(
-        client: ClientOption,
-        question_id: Annotated[str, typer.Option("--question-id")],
-        value: Annotated[str, typer.Option("--value")],
-        actor: Annotated[str, typer.Option("--actor", help="Local operator's audit label.")],
-        supersedes: Annotated[str | None, typer.Option("--supersedes-answer-id")] = None,
-    ) -> None:
-        """Record a typed operator answer to a context question."""
-        with _operator_errors():
-            profile, store = load(client)
-            answer = confirm_question(
-                profile,
-                store,
-                question_id,
-                value,
-                actor,
-                supersedes_answer_id=supersedes,
-            )
-            typer.echo(
-                f"Confirmed {question_id} · answer {answer.answer_id} · revision {answer.revision}"
-            )
-
-    return app
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    console.print(f"Wrote {path}")
 
 
-class AdminAction(StrEnum):
-    LIST = "list"
-    CONFIRM = "confirm"
-    EDIT = "edit"
-    CANCEL = "cancel"
-    PROPOSE = "propose"
-
-
-class AssumptionMethod(StrEnum):
-    INCREMENT = "incremental_quantity"
-    PERCENT = "proportional_change"
-
-
-def register_review_commands(
-    app: typer.Typer, load: Callable[[str], tuple[ClientProfile, EngineStore]]
-):
-    @app.command("reason-replay")
-    def reason_replay(
-        client: ClientOption,
-        review_id: Annotated[str, typer.Option("--review-id")],
-        as_json: Annotated[bool, typer.Option("--json")] = False,
-    ) -> None:
-        """Verify and reproduce a finalized review offline."""
-        with _operator_errors():
-            _, store = load(client)
-            result = replay_review(store, review_id)
-            if as_json:
-                typer.echo(result.model_dump_json(indent=2))
-            else:
-                outcome = "Reproduced" if result.reproduced else "Replay incomplete"
-                typer.echo(
-                    f"{outcome} · {review_id} · {len(result.stored_assessments)} saved findings"
-                )
-                typer.echo(f"Knowledge cutoff {result.manifest.knowledge_cutoff.isoformat()}")
-                typer.echo(
-                    "Integrity seal " + ("verified" if result.seal_verified else "unverified")
-                )
-                for value in (*result.issues, *result.limitations)[:PREVIEW_LIMIT]:
-                    typer.echo(f"  {value}")
-            if not result.reproduced:
-                raise typer.Exit(1)
-
-    @app.command("reason-evaluate")
-    def reason_evaluate(
-        client: ClientOption,
-        review_ids: Annotated[list[str], typer.Option("--review-id")],
-        outcomes: Annotated[Path, typer.Option("--outcomes", dir_okay=False)],
-        group_labels: Annotated[Path | None, typer.Option("--group-labels", dir_okay=False)] = None,
-        triage_labels: Annotated[
-            Path | None, typer.Option("--triage-labels", dir_okay=False)
-        ] = None,
-        as_of: Annotated[str | None, typer.Option("--as-of")] = None,
-        as_json: Annotated[bool, typer.Option("--json")] = False,
-    ) -> None:
-        """Compare frozen review decisions against dated outcomes."""
-        with _operator_errors():
-            profile, store = load(client)
-            try:
-                cutoff = datetime.fromisoformat(as_of) if as_of is not None else None
-            except ValueError as exc:
-                raise ContextError("Provide an ISO evaluation cutoff with a UTC offset") from exc
-            result = evaluate_reviews(
-                profile,
-                store,
-                tuple(review_ids),
-                outcomes,
-                as_of=cutoff,
-                group_labels_path=group_labels,
-                triage_labels_path=triage_labels,
-            )
-            if as_json:
-                typer.echo(result.model_dump_json(indent=2))
-                return
-            typer.echo(
-                f"{len(result.review_ids)} reviews · {result.aggregate_unique_rows} unique monthly "
-                f"decisions by window · {result.repeated_rows_removed} repeated decisions omitted"
-            )
-            for comparison in result.point_comparisons:
-                if comparison.review_id is not None:
-                    continue
-                errors = ", ".join(
-                    f"{score.comparator} MAE {score.mae:.4g}"
-                    + (f" WAPE {score.wape:.2%}" if score.wape is not None else " WAPE unknown")
-                    if score.mae is not None
-                    else f"{score.comparator} unavailable"
-                    for score in comparison.errors
-                )
-                comparison_label = comparison.comparison
-                if comparison.provenance:
-                    comparison_label += f" · {comparison.provenance}"
-                typer.echo(
-                    f"{comparison.phase} · {comparison.unit or 'unit unknown'} "
-                    f"· {comparison.target} · {comparison_label} "
-                    f"· {comparison.n}/{comparison.candidate_rows} rows · {errors}"
-                )
-                if comparison.exclusions:
-                    typer.echo(
-                        "  "
-                        + ", ".join(
-                            f"{name}={count}" for name, count in comparison.exclusions.items()
-                        )
-                    )
-            if result.conditional_ranges:
-                resolved = sum(item.resolved for item in result.conditional_ranges)
-                unresolved = sum(item.unresolved for item in result.conditional_ranges)
-                typer.echo(f"{resolved} realized conditions · {unresolved} unresolved ranges")
-            for usage in result.aggregate_usage:
-                typer.echo(
-                    f"{usage.stage} · {usage.provider} {usage.transport} · "
-                    f"{usage.attempts} attempts · {usage.retries} retries "
-                    f"· {usage.cache_hits} cache hits"
-                )
-
+def register_reason_commands(app: typer.Typer, load: Callable) -> None:
     @app.command("reason")
     def reason(
         client: ClientOption,
-        run_id: Annotated[int, typer.Option("--run-id", min=1)],
-        batch_id: Annotated[str | None, typer.Option("--batch-id")] = None,
-        followup_limit: Annotated[
-            int | None, typer.Option("--follow-up-limit", min=0, max=3)
+        run_id: Annotated[
+            int | None, typer.Option("--run-id", help="Forecast run; default latest.")
         ] = None,
-        resume_id: Annotated[str | None, typer.Option("--resume-id")] = None,
-        new_review: Annotated[
-            bool, typer.Option("--new-review", help="Start a fresh review budget.")
+        dry_run: Annotated[
+            bool, typer.Option("--dry-run", help="Collect signals, estimate cost, no AI call.")
         ] = False,
+        full: Annotated[
+            bool, typer.Option("--full", help="Reassess every driver, ignore the last run.")
+        ] = False,
+        llm: Annotated[
+            LLMMode, typer.Option("--llm", help="live, record (save answers) or replay (offline).")
+        ] = LLMMode.live,
+        scenario: Annotated[
+            Path | None,
+            typer.Option("--scenario", help="Scenario pack JSON instead of live sources."),
+        ] = None,
+        as_of: Annotated[
+            str | None, typer.Option("--as-of", help="Review date YYYY-MM-DD.")
+        ] = None,
+        html: Annotated[
+            Path | None, typer.Option("--html", help="Also write the HTML report here.")
+        ] = None,
         as_json: Annotated[bool, typer.Option("--json")] = False,
     ) -> None:
-        """Review one stored monthly forecast and its evidence."""
-        with _operator_errors():
-            profile, store = load(client)
-            review = run_review(
+        """Review a saved monthly forecast against external factors (0-3 AI calls)."""
+        profile, store = load(client)
+        try:
+            run = run_review(
                 profile,
                 store,
                 run_id,
-                batch_id=batch_id,
-                followup_limit=followup_limit,
-                resume_id=resume_id,
-                new_review=new_review,
-                on_start=lambda identifier: typer.echo(f"Review ID {identifier}", err=True),
-                on_collection_start=lambda identifier: typer.echo(
-                    f"Collection ID {identifier}", err=True
+                Options(
+                    llm_mode=llm.value,
+                    scenario=scenario,
+                    dry_run=dry_run,
+                    full=full,
+                    as_of=date.fromisoformat(as_of) if as_of else None,
                 ),
             )
-            if as_json:
-                typer.echo(review.model_dump_json())
-            else:
-                print_summary(load_report(store, review.review_id))
+        except (ReasoningError, ValueError) as exc:
+            raise _fail(exc) from exc
+        if as_json:
+            typer.echo(run.model_dump_json(indent=2))
+        else:
+            print_run(run)
+        if html and not dry_run:
+            _write(html, render_html(run))
 
     @app.command("reason-report")
     def reason_report(
         client: ClientOption,
-        review_id: Annotated[str, typer.Option("--review-id")],
+        reason_id: Annotated[
+            str | None, typer.Option("--reason-id", help="Default: latest run.")
+        ] = None,
+        html: Annotated[Path | None, typer.Option("--html")] = None,
+        markdown: Annotated[Path | None, typer.Option("--markdown")] = None,
         as_json: Annotated[bool, typer.Option("--json")] = False,
-        markdown: Annotated[bool, typer.Option("--markdown")] = False,
-        output: Annotated[Path | None, typer.Option("--output", dir_okay=False)] = None,
     ) -> None:
-        """Read a saved review offline or export its full JSON or Markdown."""
-        if (as_json and markdown) or (output is not None and not (as_json or markdown)):
-            raise typer.BadParameter("Select one export format with --json or --markdown")
-        with _operator_errors():
-            _, store = load(client)
-            report = load_report(store, review_id)
-            if not (as_json or markdown):
-                print_summary(report)
-                return
-            document = (
-                report.model_dump_json(indent=2) + "\n" if as_json else render_markdown(report)
-            )
-            if output is None:
-                typer.echo(document, nl=False)
-            else:
-                try:
-                    output.write_text(document, encoding="utf-8")
-                except OSError as exc:
-                    raise ContextError(
-                        f"Could not write report to {output}: {exc.strerror}"
-                    ) from exc
+        """Reopen a saved run offline (no AI call)."""
+        _, store = load(client)
+        run = records.load_run(store, reason_id) if reason_id else records.latest_run(store)
+        if run is None:
+            raise _fail(ReasoningError("No saved reasoning run. Run `engine reason` first."))
+        if as_json:
+            typer.echo(run.model_dump_json(indent=2))
+        elif not (html or markdown):
+            print_run(run)
+        if html:
+            _write(html, render_html(run))
+        if markdown:
+            _write(markdown, render_markdown(run))
 
-    @app.command("reason-admin")
-    def reason_admin(
+    @app.command("reason-adjust")
+    def reason_adjust(
         client: ClientOption,
-        review_id: Annotated[str, typer.Option("--review-id")],
-        action: Annotated[AdminAction, typer.Option("--action")] = AdminAction.LIST,
-        question_id: Annotated[str | None, typer.Option("--question-id")] = None,
-        actor: Annotated[str | None, typer.Option("--actor")] = None,
-        value: Annotated[str | None, typer.Option("--value")] = None,
-        text: Annotated[str | None, typer.Option("--text")] = None,
-        method: Annotated[AssumptionMethod | None, typer.Option("--method")] = None,
-        low: Annotated[float | None, typer.Option("--low")] = None,
-        high: Annotated[float | None, typer.Option("--high")] = None,
-        low_condition: Annotated[str | None, typer.Option("--low-condition")] = None,
-        high_condition: Annotated[str | None, typer.Option("--high-condition")] = None,
-        rationale: Annotated[str | None, typer.Option("--rationale")] = None,
-        unit: Annotated[str | None, typer.Option("--unit")] = None,
-        series: Annotated[list[str] | None, typer.Option("--series")] = None,
-        as_json: Annotated[bool, typer.Option("--json")] = False,
+        reason_id: Annotated[str, typer.Option("--reason-id")],
+        finding: Annotated[str, typer.Option("--finding", help="Finding id, e.g. F2.")],
+        action: Annotated[Action, typer.Option("--action")],
+        by: Annotated[str, typer.Option("--by", help="Planner's name for the audit trail.")],
+        low: Annotated[float | None, typer.Option("--low", help="Edited low %.")] = None,
+        high: Annotated[float | None, typer.Option("--high", help="Edited high %.")] = None,
+        note: Annotated[str, typer.Option("--note")] = "",
     ) -> None:
-        """List, confirm, edit, or cancel review questions."""
-        with _operator_errors():
-            profile, store = load(client)
-            if action == AdminAction.LIST:
-                review = load_review(store, review_id)
-                if as_json:
-                    typer.echo(json.dumps([q.model_dump(mode="json") for q in review.questions]))
-                else:
-                    typer.echo(f"Review {review.review_id}")
-                    for question in review.questions:
-                        typer.echo(
-                            f"{question.status} · {question.question_id} · {question.message}"
-                        )
-                        if question.scope:
-                            scope = question.scope
-                            typer.echo(f"  {scope.period:%Y-%m} · {scope.target} · {scope.unit}")
-                            for name, baseline in question.baselines:
-                                typer.echo(f"  {name}: {baseline:g} {scope.unit}")
-                return
-            if not question_id:
-                raise ContextError("Provide --question-id")
-            if action == AdminAction.PROPOSE:
-                if not text:
-                    raise ContextError("Provide the operator answer with --text")
-                identifier, proposal = propose_clarification(
-                    profile, store, review_id, question_id, text
-                )
-                typer.echo(json.dumps({"review_id": identifier, "proposed_value": proposal}))
-                return
-            if not actor:
-                raise ContextError("Provide --actor")
-            fields = dict(
-                method_id=method.value if method else None,
-                low=low,
-                high=high,
-                low_condition=low_condition,
-                high_condition=high_condition,
-                rationale=rationale,
-                unit=unit,
-                series_ids=series,
-            )
-            assumption = None
-            if any(item is not None for item in fields.values()):
-                try:
-                    assumption = AssumptionInput.model_validate(fields)
-                except ValidationError as exc:
-                    raise ContextError(
-                        "Provide --method, finite --low and --high, both conditions, "
-                        "--rationale, --unit and one --series for each included series"
-                    ) from exc
-            review = resolve_review_question(
+        """Accept, edit or dismiss a finding. Bands are recomputed with no AI call."""
+        profile, store = load(client)
+        if action is Action.edit and (low is None or high is None):
+            raise _fail(ReasoningError("--action edit needs --low and --high"))
+        try:
+            run = apply_override(
                 profile,
                 store,
-                review_id,
-                question_id,
-                action.value,
-                actor,
-                value=value,
-                assumption=assumption,
+                Override(
+                    reason_id=reason_id,
+                    finding_id=finding,
+                    action=action.value,
+                    low_pct=low,
+                    high_pct=high,
+                    actor=by,
+                    note=note,
+                    at=datetime.now(UTC),
+                ),
             )
-            report = load_report(store, review.review_id)
-            if as_json:
-                typer.echo(report.model_dump_json())
+        except ReasoningError as exc:
+            raise _fail(exc) from exc
+        print_run(run)
+
+    @app.command("reason-onboard")
+    def reason_onboard(
+        client: ClientOption,
+        about: Annotated[
+            Path | None, typer.Option("--about", help="Text file describing the company.")
+        ] = None,
+        answers: Annotated[
+            Path | None, typer.Option("--answers", help="Admin answers to the draft's questions.")
+        ] = None,
+        confirm: Annotated[
+            bool, typer.Option("--confirm", help="Mark the profile confirmed.")
+        ] = False,
+        actor: Annotated[
+            str, typer.Option("--by", help="Admin's name for the audit trail.")
+        ] = "admin",
+        llm: Annotated[LLMMode, typer.Option("--llm")] = LLMMode.live,
+    ) -> None:
+        """Draft the company profile from ERP data, or apply the admin's answers (1 AI call)."""
+        profile, store = load(client)
+        try:
+            config = require_reasoning(profile)
+            if not config.llm.model:
+                raise ReasoningError("Set reasoning.llm.model in the client profile.")
+            model = get_client(config.llm, llm.value, recordings_path(profile))
+            started = datetime.now(UTC)
+            if answers:
+                current = load_profile(profile)
+                draft, result = apply_answers(
+                    profile,
+                    store,
+                    model,
+                    config.llm.model,
+                    config.llm.max_output_tokens,
+                    current,
+                    answers.read_text(encoding="utf-8"),
+                )
+                stage = "onboard_answers"
             else:
-                print_summary(report)
+                if profile_path(profile).exists() and not typer.confirm(
+                    f"{profile_path(profile)} exists. Replace it with a new draft?", default=False
+                ):
+                    raise typer.Exit()
+                draft, result = draft_profile(
+                    profile,
+                    store,
+                    model,
+                    config.llm.model,
+                    config.llm.max_output_tokens,
+                    about.read_text(encoding="utf-8") if about else "",
+                )
+                stage = "onboard"
+        except (ReasoningError, LLMError) as exc:
+            raise _fail(exc) from exc
+        records.save_call(
+            store,
+            None,
+            LLMCall(
+                call_id=result.request_hash[:12] or "onboard",
+                stage=stage,
+                provider=result.provider,
+                model=result.model,
+                started_at=started,
+                seconds=round((datetime.now(UTC) - started).total_seconds(), 2),
+                usage=result.usage,
+                cost=0.0
+                if result.replayed
+                else cost(result.usage, config.llm.rates.get(result.model)),
+                outcome="replayed" if result.replayed else "ok",
+                request_hash=result.request_hash,
+            ),
+        )
+        if confirm:
+            draft = draft.model_copy(update={"status": "confirmed"})
+        path = save_profile(profile, store, draft, actor)
+        console.print(
+            f"Saved {draft.status} profile to {path}: {len(draft.families)} families, "
+            f"{len(draft.drivers)} drivers."
+        )
+        if draft.notes:
+            console.print(f"[yellow]Checks:[/yellow] {draft.notes}")
+        if draft.open_questions:
+            console.print(
+                "\n[bold]Questions for the admin[/bold] (answer them in a text file, then "
+                f"run `engine reason-onboard --client {client} --answers FILE`):"
+            )
+            for number, question in enumerate(draft.open_questions, 1):
+                console.print(f"  {number}. {question}")
+
+    @app.command("reason-cost")
+    def reason_cost(
+        client: ClientOption, as_json: Annotated[bool, typer.Option("--json")] = False
+    ) -> None:
+        """AI calls, tokens and cost recorded for this client."""
+        _, store = load(client)
+        ledger = records.call_ledger(store)
+        if as_json:
+            typer.echo(json.dumps(ledger, default=str, indent=2))
+            return
+        table = Table(
+            "When",
+            "Run",
+            "Stage",
+            "Model",
+            "In",
+            "Out",
+            "Cached",
+            "Cost",
+            "Outcome",
+            title=f"AI calls · {client}",
+        )
+        for row in ledger:
+            table.add_row(
+                f"{row['started_at']:%Y-%m-%d %H:%M}",
+                row["reason_id"] or "-",
+                row["stage"],
+                row["model"],
+                f"{row['input_tokens']:,}",
+                f"{row['output_tokens']:,}",
+                f"{row['cached_input_tokens']:,}",
+                "?" if row["cost"] is None else f"{row['cost']:.4f}",
+                row["outcome"],
+            )
+        console.print(table)
+        known = [row["cost"] for row in ledger if row["cost"] is not None]
+        console.print(
+            f"{len(ledger)} calls · known cost {sum(known):.4f} "
+            f"({len(ledger) - len(known)} without a configured rate)"
+        )

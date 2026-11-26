@@ -1,0 +1,8 @@
+id: festival
+kind: calendar
+description: Festival or holiday dates in the forecast months versus last year, with the uplift measured in the client's own history.
+connectors: [calendar]
+required_params: [festival]
+mechanism_hint: >-
+  Festivals lift or pause demand around their date. When a festival moves to a
+  different month than last year, a seasonal forecast can put the peak in the wrong month.

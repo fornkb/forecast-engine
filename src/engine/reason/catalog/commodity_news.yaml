@@ -1,0 +1,9 @@
+id: commodity_news
+kind: commodity
+description: Price and supply news for a raw material or input (oil, copper, resin, sugar...).
+connectors: [news]
+news_query: '"{commodity}" price'
+required_params: [commodity]
+mechanism_hint: >-
+  Input price spikes and shortages first hit cost and supply. They change customer
+  demand only when prices are passed on or products become unavailable.

@@ -1,0 +1,82 @@
+{
+  "name": "Teknic: copper spike and a Diwali month shift",
+  "as_of": "2026-08-31",
+  "note": "illustrative signals for a demonstration; all articles and weather values are invented",
+  "drivers": {
+    "copper": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/copper-record-aug",
+            "title": "[Scenario] Copper hits a record as mine outages tighten supply",
+            "source": "scenario.example",
+            "published": "2026-08-26T08:00:00Z",
+            "snippet": "Benchmark copper rose 11% in August; Indian wire and switchgear makers said they would raise prices from October."
+          }
+        ]
+      }
+    ],
+    "plastics": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/polycarbonate-steady",
+            "title": "[Scenario] Polycarbonate prices hold steady in India as imports rise",
+            "source": "scenario.example",
+            "published": "2026-08-20T08:00:00Z",
+            "snippet": "Prices were broadly unchanged in August."
+          }
+        ]
+      }
+    ],
+    "monsoon": [
+      {
+        "kind": "weather",
+        "summary": "Mumbai and Maharashtra seasonal outlook (scenario values): 2026-09: 28.1°C (+0.2 vs normal), rain 420 mm vs normal 330 mm; 2026-10: 28.9°C (+0.3 vs normal), rain 110 mm vs normal 80 mm; 2026-11: 28.4°C (+0.4 vs normal), rain 15 mm vs normal 18 mm",
+        "data": {
+          "region": "mumbai",
+          "months": [
+            {"period": "2026-09", "coverage": "complete", "temp_c": 28.1, "temp_anomaly_c": 0.2, "rain_mm": 420, "rain_normal_mm": 330},
+            {"period": "2026-10", "coverage": "complete", "temp_c": 28.9, "temp_anomaly_c": 0.3, "rain_mm": 110, "rain_normal_mm": 80},
+            {"period": "2026-11", "coverage": "complete", "temp_c": 28.4, "temp_anomaly_c": 0.4, "rain_mm": 15, "rain_normal_mm": 18}
+          ]
+        }
+      },
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/monsoon-withdrawal-late",
+            "title": "[Scenario] Monsoon withdrawal from Maharashtra expected to be delayed into October",
+            "source": "scenario.example",
+            "published": "2026-08-29T06:00:00Z",
+            "snippet": "Above-normal September rain is forecast for the Konkan coast, including Mumbai."
+          }
+        ]
+      }
+    ],
+    "import_duty": [
+      {"kind": "news", "summary": "scenario articles", "articles": []}
+    ],
+    "construction": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/mmr-housing-launches",
+            "title": "[Scenario] Mumbai region housing launches up 9% in the June quarter",
+            "source": "scenario.example",
+            "published": "2026-08-12T08:00:00Z",
+            "snippet": "Developers expect deliveries to keep electrical contractors busy through the festive season."
+          }
+        ]
+      }
+    ]
+  }
+}

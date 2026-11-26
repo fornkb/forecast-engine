@@ -13,3 +13,6 @@ data/processed/
 # permit redistribution — regenerate with scripts/prepare_*.py instead.
 data/raw/m5/
 data/raw/m5_walmart*.parquet
+
+# Reasoning reports written by `engine reason --html`
+reports/

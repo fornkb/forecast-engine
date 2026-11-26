@@ -1,668 +1,348 @@
-"""Runtime records shared by the advisory services."""
+"""Records shared by the reasoning layer.
+
+Three groups:
+  * company profile + driver templates (what a company is and what to watch)
+  * signals collected for each driver (what changed outside)
+  * model answers, checked findings and per-SKU bands (what it means for the forecast)
+
+Model-facing answer schemas (`*Out`) use only required fields, enums, lists and
+plain objects, because that is the subset OpenAI, Anthropic and Gemini all accept
+for strict JSON output. Value checks happen in Python (adjust.py), not in the schema.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator
 from datetime import date, datetime
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import AwareDatetime, Field, StrictBool, StrictFloat, StrictStr, StringConstraints
+from pydantic import AwareDatetime, Field
 
 from engine.config.base import StrictModel
-from engine.reason.config import (
-    OperationalDataset,
-    ProviderRate,
-    TargetConfig,
-    WeatherClimatology,
-    WeatherRole,
-)
 
 
-class ContextError(RuntimeError):
-    """An invalid forecast, context input, or operator action."""
+class ReasoningError(RuntimeError):
+    """A problem the operator can fix: missing setup, bad input or an unusable answer."""
 
 
-def content_digest(value: object) -> str:
-    data = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str, allow_nan=False)
-    return hashlib.sha256(data.encode()).hexdigest()
+def digest(value: object) -> str:
+    """Stable short hash of any JSON-serializable value."""
+    data = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
 
 
-class ContextGap(StrictModel):
-    code: str
-    message: str
-    series_id: str | None = None
-    period: date | None = None
-    fact_version_ids: tuple[str, ...] = ()
+# --------------------------------------------------------------------------- profile
+
+ParamValue = str | int | float | bool | list[str]
 
 
-class ForecastRow(StrictModel):
-    client_id: str
-    forecast_run_id: int
-    series_id: str
-    period: date
-    target_start: AwareDatetime
-    target_end: AwareDatetime
-    cutoff_period: date
-    horizon: int
-    model: str
-    baseline: float
-    item_id: str | None = None
-    customer_id: str | None = None
-    unit: str | None = None
-    fact_version_ids: tuple[str, ...] = ()
-    superseded_fact_version_ids: tuple[str, ...] = ()
-
-
-class ForecastSnapshot(StrictModel):
-    snapshot_id: str
-    client_id: str
-    forecast_run_id: int
-    input_digest: str
-    config_digest: str
-    metadata_digest: str
-    captured_at: AwareDatetime
-    metadata_observed_at: AwareDatetime
-    forecast_created_at_local: datetime
-    forecast_available_at: AwareDatetime | None = None
-    timezone: str
-    granularity: str = "monthly"
-    target: TargetConfig | None = None
-    gaps: tuple[ContextGap, ...] = ()
-    question_ids: tuple[str, ...] = ()
-    rows: tuple[ForecastRow, ...]
-
-    def iter_rows(self, series_id: str | None = None) -> Iterator[ForecastRow]:
-        return (row for row in self.rows if series_id is None or row.series_id == series_id)
-
-
-class EntityRef(StrictModel):
-    type: str
+class Region(StrictModel):
     id: str
+    name: str
+    country: str = ""  # ISO 3166 alpha-2, e.g. IN
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
 
 
-FactValue = StrictStr | StrictFloat | StrictBool | TargetConfig
-LocationRole = WeatherRole
-AnswerType = Literal["text", "number", "boolean", "object_id", "target"]
+class FamilyMatch(StrictModel):
+    """How SKUs (forecast series) are assigned to a family. Any rule may match."""
+
+    item_group: list[str] = Field(default_factory=list)
+    item_prefix: list[str] = Field(default_factory=list)
+    series: list[str] = Field(default_factory=list)
 
 
-class CompanyFact(StrictModel):
-    client_id: str
-    fact_version_id: str
-    source_id: str
-    record_id: str
-    source_ref: str
-    source_version: str | None = None
-    content_digest: str
-    subject: EntityRef
-    relation: str
-    object: EntityRef | None = None
-    value: FactValue | None = None
-    location_role: LocationRole | None = None
-    cardinality: Literal["one", "many"] = "many"
-    effective_from: AwareDatetime
-    effective_to: AwareDatetime | None = None
-    known_at: AwareDatetime
-    captured_at: AwareDatetime
-    status: Literal["active", "withdrawn", "confirmed"]
-    actor: str | None = None
-    resolves_fact_ids: tuple[str, ...] = ()
-
-    @property
-    def field_key(self) -> tuple[EntityRef, str, LocationRole | None]:
-        return self.subject, self.relation, self.location_role
+class Family(StrictModel):
+    id: str
+    name: str
+    description: str = ""
+    match: FamilyMatch = Field(default_factory=FamilyMatch)
+    inputs: list[str] = Field(default_factory=list)  # raw materials / key inputs
+    regions: list[str] = Field(default_factory=list)  # Region ids where it sells
+    customers: str = ""
 
 
-class FactConflict(StrictModel):
-    subject: EntityRef
-    relation: str
-    location_role: LocationRole | None = None
-    fact_version_ids: tuple[str, ...]
+class Driver(StrictModel):
+    """One external factor to watch. `template` names a catalogue entry."""
+
+    id: str
+    template: str
+    families: list[str] = Field(default_factory=lambda: ["*"])
+    mechanism: str = ""  # plain-words cause → effect, written or confirmed by the admin
+    params: dict[str, ParamValue] = Field(default_factory=dict)
+    enabled: bool = True
 
 
-class QuestionSpec(StrictModel):
-    subject: EntityRef
-    field: str
-    purpose: Literal["missing_fact", "fact_conflict", "mapping_confirmation"]
-    message: str
-    answer_type: AnswerType
-    object_type: str | None = None
-    location_role: LocationRole | None = None
-    cardinality: Literal["one", "many"] = "one"
-    affected_months: tuple[date, ...] = ()
-    evidence_ids: tuple[str, ...] = ()
-    event_ids: tuple[str, ...] = ()
-    candidate_fact_ids: tuple[str, ...] = ()
+class Company(StrictModel):
+    name: str
+    summary: str = ""
+    regions: list[Region] = Field(default_factory=list)
 
 
-class QuestionAnswer(StrictModel):
-    answer_id: str
-    question_id: str
-    revision: int
-    value: FactValue
-    actor: str
-    confirmed_at: AwareDatetime
-    fact_version_id: str
-    supersedes_answer_id: str | None = None
-    spec: QuestionSpec | None = None
+class CompanyProfile(StrictModel):
+    status: Literal["draft", "confirmed"] = "draft"
+    company: Company
+    families: list[Family]
+    drivers: list[Driver] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+    def family(self, family_id: str) -> Family | None:
+        return next((item for item in self.families if item.id == family_id), None)
+
+    def region(self, region_id: str) -> Region | None:
+        return next((item for item in self.company.regions if item.id == region_id), None)
 
 
-class Question(StrictModel):
-    client_id: str
-    question_id: str
-    spec: QuestionSpec
-    status: Literal["pending", "confirmed"]
-    opened_at: AwareDatetime
-    answer: QuestionAnswer | None = None
+class DriverTemplate(StrictModel):
+    """A reusable kind of external factor, shipped in reason/catalog/*.yaml."""
+
+    id: str
+    kind: Literal["climate", "weather", "commodity", "calendar", "policy", "geopolitics", "market"]
+    description: str
+    connectors: list[Literal["news", "weather", "enso", "calendar"]]
+    news_query: str = ""  # may use {param} placeholders filled from Driver.params
+    mechanism_hint: str = ""
+    required_params: list[str] = Field(default_factory=list)
 
 
-class SyncResult(StrictModel):
-    new: int = 0
-    reused: int = 0
-    conflicted: int = 0
-    invalid: int = 0
+# --------------------------------------------------------------------------- signals
 
 
-class ContextSyncError(ContextError):
-    def __init__(self, message: str, invalid: int = 0) -> None:
-        super().__init__(message)
-        self.invalid = invalid
-
-
-SourceKind = Literal["erp", "news", "weather", "enso"]
-CheckStatus = Literal["found", "no_match", "unavailable", "not_applicable"]
-CoverageStatus = Literal["complete", "partial", "none"]
-
-
-class QueryScope(StrictModel):
-    client_id: str
-    source_kind: SourceKind
-    source_id: str
-    query_hash: str
-    entity_ids: tuple[EntityRef, ...] = ()
-    public_aliases: tuple[str, ...] = ()
-    coordinates: tuple[float, float] | None = None
-    location_role: WeatherRole | None = None
-    valid_from: AwareDatetime
-    valid_to: AwareDatetime
-    months: tuple[date, ...]
-    filters: tuple[tuple[str, str], ...] = ()
-    page: int = 0
-
-
-class VariableCoverage(StrictModel):
-    variable: Literal["temperature_2m", "precipitation"]
-    status: CoverageStatus
-    complete_members: int
-    expected_members: int
-
-
-class MonthCoverage(StrictModel):
-    period: date
-    status: CoverageStatus
-    reason: str | None = None
-    variables: tuple[VariableCoverage, ...] = ()
-
-
-class SourceCheck(StrictModel):
-    check_id: str
-    scope: QueryScope
-    provider: str
-    started_at: AwareDatetime
-    ended_at: AwareDatetime
-    status: CheckStatus
-    coverage: CoverageStatus
-    reason: str | None = None
-    covered_from: AwareDatetime | None = None
-    covered_to: AwareDatetime | None = None
-    months: tuple[MonthCoverage, ...] = ()
-    evidence_ids: tuple[str, ...] = ()
-    requests: int = 0
-    attempts: int = 0
-    retries: int = 0
-    cache_hits: int = 0
-    reused_check_id: str | None = None
-    provider_status: str | None = None
-    retryable: bool = False
-    more_pages: bool = False
-
-
-class OperationalRecord(StrictModel):
-    dataset: OperationalDataset
-    status: str
-    movement: Literal["snapshot", "inflow", "outflow", "reference"]
-    stock_basis: Literal["site_total", "warehouse"] | None = None
-    material_id: str | None = None
-    site_id: str | None = None
-    warehouse_id: str | None = None
-    item_id: str | None = None
-    customer_id: str | None = None
-    series_id: str | None = None
-    supplier_id: str | None = None
-    route_id: str | None = None
-    alternate_material_id: str | None = None
-    finished_unit: str | None = None
-    converted_unit: str | None = None
-    conversion_factor: float | None = None
-    lead_time_days: int | None = None
-    ordered_at: AwareDatetime | None = None
-    original_date: AwareDatetime | None = None
-    receipt_id: str | None = None
-    reservation_id: str | None = None
-    parameter_id: str | None = None
-    actor: str | None = None
-    prior_version: str | None = None
-    condition: str | None = None
-    baseline_includes: bool | None = None
-    target_id: str | None = None
-    basis: str | None = None
-    parameter_role: (
-        Literal["percent_change", "sensitivity", "scenario_driver", "expected_driver"] | None
-    ) = None
-    validation_ref: str | None = None
-    training_cutoff: AwareDatetime | None = None
-    minimum_driver: float | None = Field(default=None, allow_inf_nan=False)
-    maximum_driver: float | None = Field(default=None, allow_inf_nan=False)
-    lag_months: int | None = Field(default=None, ge=0, le=24)
-    min_horizon: int | None = Field(default=None, ge=1)
-    max_horizon: int | None = Field(default=None, ge=1)
-    date_precision: Literal["day", "instant"]
-
-
-class NewsArticle(StrictModel):
+class Article(StrictModel):
+    url: str
     title: str
-    publisher: str
-    primary: bool = False
-    provider_page_date: str | None = None
-    provider_fetched_at: AwareDatetime | None = None
-    duplicate_key: str
+    source: str
+    published: AwareDatetime | None = None
+    snippet: str = ""
+    country: str = ""
 
 
-class WeatherMember(StrictModel):
-    member: str
-    quantity: float | None
-    covered_seconds: int
+class Signal(StrictModel):
+    """One observation for one driver, kept small enough to show the model directly."""
+
+    driver_id: str
+    kind: Literal["news", "weather", "enso", "calendar", "measured"]
+    summary: str
+    data: dict = Field(default_factory=dict)
+    articles: list[Article] = Field(default_factory=list)
+    source_ref: str = ""
+    ok: bool = True
+    error: str | None = None
 
 
-class MonthlyWeather(StrictModel):
-    period: date
-    variable: Literal["temperature_2m", "precipitation"]
-    model: str
-    timezone: str
+class DriverState(StrictModel):
+    driver_id: str
+    status: Literal["changed", "unchanged", "no_data", "error"]
+    fingerprint: str
+    signals: list[Signal] = Field(default_factory=list)
+    # News URLs already reasoned about in an earlier run (not sent again).
+    seen_urls: list[str] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- model answers
+
+
+class TriageKeepOut(StrictModel):
+    id: str
+    relevance: int
+    why: str
+
+
+class TriageOut(StrictModel):
+    keep: list[TriageKeepOut]
+
+
+Channel = Literal["demand", "supply_risk", "cost"]
+Tier = Literal["measured", "sourced", "judgment", "none"]
+
+
+class FindingOut(StrictModel):
+    driver_id: str
+    family_id: str
+    channel: Channel
+    direction: Literal["up", "down", "mixed", "none"]
+    months: list[str]
+    low_pct: float
+    high_pct: float
+    evidence_tier: Tier
+    quote: str
+    citations: list[str]
+    already_in_forecast: bool
+    confidence: Literal["low", "medium", "high"]
+    reasoning: str
+
+
+class QuietOut(StrictModel):
+    driver_id: str
+    reason: str
+
+
+class ReasoningOut(StrictModel):
+    summary: str
+    findings: list[FindingOut]
+    no_change: list[QuietOut]
+
+
+class ParamOut(StrictModel):
+    name: str
+    value: str
+
+
+class RegionOut(StrictModel):
+    id: str
+    name: str
+    country: str
     latitude: float
     longitude: float
-    grid_resolution_km: int = 36
-    bias_corrected: bool = False
-    interval_seconds: int
-    expected_seconds: int
-    members: tuple[WeatherMember, ...]
-    expected_members: int
-    interval_semantics: tuple[str, ...] = ()
-    minimum: float | None = None
-    maximum: float | None = None
-    climatology: WeatherClimatology | None = None
-    anomaly: float | None = None
 
 
-class EnsoSeason(StrictModel):
-    label: str
-    start: date
-    end: date
-    statements: tuple[str, ...] = ()
-
-
-class EnsoAdvisory(StrictModel):
-    issue_date: date
-    geographic_scope: str = "Equatorial Pacific ENSO"
-    seasons: tuple[EnsoSeason, ...]
-
-
-class EvidenceRevision(StrictModel):
-    client_id: str
-    evidence_id: str
-    record_id: str
-    revision: int
-    source_kind: SourceKind
-    source_id: str
-    source_ref: str
-    source_version: str | None = None
-    source_event_id: str | None = None
-    issued_at: AwareDatetime | None = None
-    source_known_at: AwareDatetime | None = None
-    first_known_at: AwareDatetime
-    captured_at: AwareDatetime
-    valid_from: AwareDatetime | None = None
-    valid_to: AwareDatetime | None = None
-    location_id: str | None = None
-    excerpt: str | None = None
-    quantity: float | None = Field(default=None, allow_inf_nan=False)
-    unit: str | None = None
-    operational: OperationalRecord | None = None
-    news: NewsArticle | None = None
-    weather: MonthlyWeather | None = None
-    enso: EnsoAdvisory | None = None
-
-
-class QueryRequestContext(StrictModel):
-    client_id: str
-    forecast_run_id: int = Field(ge=1)
-    snapshot_id: str
-    review_id: str = Field(min_length=1, max_length=200)
-    months: tuple[date, ...]
-    request_budget: int = Field(default=3, ge=0, le=3)
-    knowledge_cutoff: AwareDatetime | None = None
-
-
-class LookupResult(StrictModel):
-    checks: tuple[SourceCheck, ...]
-    evidence_ids: tuple[str, ...] = ()
-    attempts_used: int
-
-
-class ProviderUsage(StrictModel):
-    provider: str
-    requests: int = 0
-    attempts: int = 0
-    retries: int = 0
-    cache_hits: int = 0
-
-
-class CandidateAssociation(StrictModel):
-    evidence_id: str
-    check_ids: tuple[str, ...]
-    entities: tuple[EntityRef, ...] = ()
-    basis: str
-    corroborating_ids: tuple[str, ...] = ()
-    duplicate_ids: tuple[str, ...] = ()
-
-
-class ExposureMember(StrictModel):
-    series_id: str
-    period: date
-    item_id: str | None = None
-    customer_id: str | None = None
-    shortfall: float | None = None
-
-
-class ExposureGroup(StrictModel):
-    group_id: str
-    kind: Literal["supply", "weather", "customer_order", "contract_option", "order_event", "news"]
-    dependency: EntityRef
-    period: date
-    location_id: str | None = None
-    location_role: WeatherRole | None = None
-    evidence_ids: tuple[str, ...]
-    fact_version_ids: tuple[str, ...] = ()
-    members: tuple[ExposureMember, ...]
-    exceptions: tuple[ExposureMember, ...] = ()
-    flags: tuple[str, ...] = ()
-    event_at: AwareDatetime | None = None
-    shared_shortfall: float | None = None
-    unit: str | None = None
-    event_ids: tuple[str, ...] = ()
-
-
-class EvidenceBatch(StrictModel):
-    batch_id: str
-    collection_id: str
-    client_id: str
-    forecast_run_id: int
-    snapshot_id: str
-    snapshot_captured_at: AwareDatetime
-    query_version: str
-    config_digest: str
-    started_at: AwareDatetime
-    knowledge_cutoff: AwareDatetime
-    frozen_at: AwareDatetime
-    check_ids: tuple[str, ...]
-    evidence_ids: tuple[str, ...]
-    groups: tuple[ExposureGroup, ...]
-    candidates: tuple[CandidateAssociation, ...]
-    gaps: tuple[str, ...] = ()
-    status_counts: tuple[tuple[CheckStatus, int], ...] = ()
-    complete: bool
-    usage: tuple[ProviderUsage, ...] = ()
-
-
-ReviewText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
-MethodId = Literal["incremental_quantity", "proportional_change", "historical_driver_response"]
-TargetType = Literal["demand", "cost", "material_availability", "production", "shipment_capacity"]
-Direction = Literal["increase", "decrease", "mixed", "none", "unknown"]
-Finding = Literal[
-    "what_if_range", "possible_impact", "no_material_change_found", "incomplete_review"
-]
-
-
-class MappingProposal(StrictModel):
-    event_id: ReviewText
-    article_ids: tuple[ReviewText, ...] = Field(min_length=1)
-    entities: tuple[EntityRef, ...] = Field(max_length=8)
-    fact_version_ids: tuple[ReviewText, ...] = ()
-    evidence_ids: tuple[ReviewText, ...] = ()
-    months: tuple[date, ...]
-    basis: ReviewText
-    status: Literal["established", "uncertain", "irrelevant"]
-
-
-class MappingDecision(MappingProposal):
-    decision_id: str
-    question_ids: tuple[str, ...] = ()
-    requested_status: Literal["established", "uncertain", "irrelevant"]
-    terminal_reason: str | None = None
-
-
-class OperandReference(StrictModel):
-    record_version_id: ReviewText
-    field: Literal["quantity"]
-
-
-class ConditionProposal(StrictModel):
-    condition_id: ReviewText
-    description: ReviewText
-    operands: dict[str, OperandReference] = Field(max_length=16)
-
-
-class AssessmentProposal(StrictModel):
-    group_id: ReviewText
-    event_ids: tuple[ReviewText, ...] = Field(min_length=1)
-    series_ids: tuple[ReviewText, ...] | None = None
-    target_type: TargetType
-    periods: tuple[date, ...] = Field(min_length=1)
-    direction: Direction
-    finding: Finding
-    method_id: MethodId | None = None
-    conditions: tuple[ConditionProposal, ...] = Field(default=(), max_length=2)
-    evidence_ids: tuple[ReviewText, ...] = ()
-    fact_version_ids: tuple[ReviewText, ...] = ()
-    contrary_ids: tuple[ReviewText, ...] = ()
-    required_check_ids: tuple[ReviewText, ...] = ()
-    missing_facts: tuple[ReviewText, ...] = ()
-    rationale: ReviewText
-
-
-class ScenarioScope(StrictModel):
-    group_id: str
-    event_ids: tuple[str, ...]
-    target: str
-    period: date
-    unit: str
-    series_ids: tuple[str, ...]
-
-
-class ReviewQuestion(StrictModel):
-    question_id: str
-    purpose: Literal["company_fact", "mapping_confirmation", "scenario_assumption"]
-    message: str
-    status: Literal["pending", "confirmed", "cancelled"] = "pending"
-    scope: ScenarioScope | None = None
-    baselines: tuple[tuple[str, float], ...] = ()
-    subject: EntityRef | None = None
-    related_entity: EntityRef | None = None
-    months: tuple[date, ...] = ()
-    evidence_ids: tuple[str, ...] = ()
-    fact_version_id: str | None = None
-    actor: str | None = None
-    resolved_at: AwareDatetime | None = None
-
-
-class AssumptionInput(StrictModel):
-    method_id: Literal["incremental_quantity", "proportional_change"]
-    low: StrictFloat = Field(allow_inf_nan=False)
-    high: StrictFloat = Field(allow_inf_nan=False)
-    low_condition: ReviewText
-    high_condition: ReviewText
-    rationale: ReviewText
-    unit: ReviewText
-    series_ids: tuple[ReviewText, ...] = Field(min_length=1)
-
-
-class PlannerAssumption(StrictModel):
-    assumption_id: str
-    question_id: str
-    revision: int
-    supersedes_id: str | None = None
-    scope: ScenarioScope
-    values: AssumptionInput
-    actor: str
-    confirmed_at: AwareDatetime
-    condition_ids: tuple[str, str]
-    basis: Literal["conditional_planner_assumption"] = "conditional_planner_assumption"
-
-
-class CalculationOperand(StrictModel):
+class FamilyOut(StrictModel):
+    id: str
     name: str
-    record_version_id: str
-    field: str
-    value: float = Field(allow_inf_nan=False)
-    unit: str
-    source_ref: str
-    basis: str
-
-
-class CalculatedCondition(StrictModel):
-    condition_id: str
     description: str
-    delta: float = Field(allow_inf_nan=False)
-    endpoint: float = Field(allow_inf_nan=False)
-    operands: tuple[CalculationOperand, ...]
-    basis_record_ids: tuple[str, ...] = ()
-    option_applied: bool | None = None
+    item_groups: list[str]
+    inputs: list[str]
+    regions: list[str]
+    customers: str
 
 
-class Assessment(StrictModel):
-    review_id: str
-    manifest_revision: int
-    input_digest: str
-    scenario_id: str
-    group_id: str
-    event_ids: tuple[str, ...]
+class DriverOut(StrictModel):
+    id: str
+    template: str
+    families: list[str]
+    mechanism: str
+    params: list[ParamOut]
+
+
+class ProfileDraftOut(StrictModel):
+    company_name: str
+    summary: str
+    regions: list[RegionOut]
+    families: list[FamilyOut]
+    drivers: list[DriverOut]
+    questions: list[str]
+
+
+# --------------------------------------------------------------------------- results
+
+
+class Finding(StrictModel):
+    finding_id: str
+    driver_id: str
+    family_id: str
+    channel: Channel
+    direction: Literal["up", "down", "mixed", "none"]
+    months: list[date]
+    low_pct: float
+    high_pct: float
+    tier: Tier
+    quote: str = ""
+    citations: list[str] = Field(default_factory=list)  # packet ids, e.g. A3, S1, M2
+    reasoning: str
+    confidence: Literal["low", "medium", "high"]
+    already_in_forecast: bool = False
+    flags: list[str] = Field(default_factory=list)
+    carried_from: str | None = None  # reason_id of the run that produced it
+
+
+class Band(StrictModel):
     series_id: str
-    item_id: str | None = None
-    customer_id: str | None = None
+    family_id: str
     period: date
-    horizon: int
-    model: str
-    target: str
-    target_type: TargetType
-    unit: str | None = None
-    baseline: float | None = None
-    forecast_unit: str | None = None
-    forecast_baseline: float
-    finding: Finding
-    direction: Direction = "unknown"
-    method_id: MethodId | None = None
-    method_version: str | None = None
-    conditions: tuple[CalculatedCondition, ...] = ()
-    assumption_id: str | None = None
-    evidence_ids: tuple[str, ...] = ()
-    fact_version_ids: tuple[str, ...] = ()
-    contrary_ids: tuple[str, ...] = ()
-    required_check_ids: tuple[str, ...] = ()
-    gaps: tuple[str, ...] = ()
-    rationale: str
-    supply_shortfall: float | None = None
-    supply_balance: float | None = None
-    supply_balance_scope: Literal["material_at_site"] | None = None
-    supply_unit: str | None = None
-    supply_at: AwareDatetime | None = None
+    baseline: float
+    low: float
+    high: float
+    finding_ids: list[str] = Field(default_factory=list)
 
 
-class GroupResult(StrictModel):
-    group: ExposureGroup
-    input_digest: str
-    proposal: AssessmentProposal | None = None
-    terminal_reason: str | None = None
+class FamilyMonth(StrictModel):
+    period: date
+    baseline: float
+    p10: float | None = None
+    p90: float | None = None
+    last_year: float | None = None
+    low: float | None = None
+    high: float | None = None
 
 
-class ModelCall(StrictModel):
-    call_id: str
-    stage: Literal["triage", "assessment", "clarification"]
-    work_id: str
-    started_at: AwareDatetime
-    ended_at: AwareDatetime | None = None
-    outcome: str = "reserved"
-    request_kind: Literal["initial", "continuation", "retry"] | None = None
-    token_usage_reported: bool | None = None
+class FamilySummary(StrictModel):
+    family_id: str
+    name: str
+    series_count: int
+    months: list[FamilyMonth]
+    history: list[tuple[date, float]] = Field(default_factory=list)  # last 12 months actuals
+
+
+class Usage(StrictModel):
     input_tokens: int = 0
     output_tokens: int = 0
-    cache_creation_input_tokens: int = 0
-    cache_read_input_tokens: int = 0
-    response_tools: tuple[str, ...] = ()
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
-class LookupAttempt(StrictModel):
-    attempt_id: str
-    query_hash: str
+class LLMCall(StrictModel):
+    call_id: str
+    stage: Literal["onboard", "onboard_answers", "triage", "reason"]
     provider: str
+    model: str
     started_at: AwareDatetime
-    retry: bool
-    check_id: str | None = None
+    seconds: float
+    usage: Usage
+    cost: float | None = None
+    currency: str = "USD"
+    outcome: str  # ok | replayed | error:<reason>
+    request_hash: str
 
 
-class ReviewManifest(StrictModel):
-    review_id: str
+class Reference(StrictModel):
+    """What a short packet id (A1, S2, M3) points to, kept for the report."""
+
+    id: str
+    driver_id: str
+    kind: str
+    title: str
+    url: str = ""
+    source: str = ""
+    published: str = ""
+    text: str = ""
+
+
+class ReasonRun(StrictModel):
+    reason_id: str
     client_id: str
     forecast_run_id: int
-    snapshot_id: str
-    base_batch_id: str
-    forecast_digest: str
-    collection_config_digest: str
-    successor_of: str | None = None
-    operator_action_digest: str | None = None
-    budget_owner_id: str
-    revision: int
-    state: Literal["draft", "finalized"] = "draft"
-    resume_mode: Literal["review", "operator_reassess", "operator_offline"] = "review"
-    started_at: AwareDatetime
-    collection_cutoff: AwareDatetime
-    knowledge_cutoff: AwareDatetime
-    finalized_at: AwareDatetime | None = None
-    config_digest: str
+    created_at: AwareDatetime
+    as_of: date
+    status: Literal["complete", "partial", "dry_run"]
+    inputs_hash: str
+    profile_hash: str
     prompt_version: str
-    method_version: str
-    model_id: str | None = None
-    model_request_limit: int
-    followup_limit: int
-    appended_fact_version_ids: tuple[str, ...] = ()
-    appended_check_ids: tuple[str, ...] = ()
-    appended_evidence_ids: tuple[str, ...] = ()
-    requested_scopes: tuple[QueryScope, ...] = ()
-    lookup_attempts: tuple[LookupAttempt, ...] = ()
-    model_calls: tuple[ModelCall, ...] = ()
-    candidates: tuple[CandidateAssociation, ...] = ()
-    mappings: tuple[MappingDecision, ...] = ()
-    assumptions: tuple[PlannerAssumption, ...] = ()
-    questions: tuple[ReviewQuestion, ...] = ()
-    groups: tuple[GroupResult, ...] = ()
-    gaps: tuple[str, ...] = ()
-    approved_lookups: dict | None = None
-    source_access: dict[str, Literal["csv", "postgres"]] = Field(default_factory=dict)
-    provider_rates: dict[str, ProviderRate] = Field(default_factory=dict)
-    seal: ReviewSeal | None = None
+    provider: str
+    model: str | None
+    scenario: str | None = None
+    months: list[date]
+    summary: str = ""
+    families: list[FamilySummary]
+    drivers: list[DriverState]
+    findings: list[Finding]
+    quiet: list[QuietOut] = Field(default_factory=list)
+    not_assessed: list[str] = Field(default_factory=list)  # "driver_id: reason"
+    references: list[Reference] = Field(default_factory=list)
+    bands: list[Band] = Field(default_factory=list)
+    calls: list[LLMCall] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    unassigned_series: int = 0
+    estimate: dict = Field(default_factory=dict)  # dry-run token/cost estimate
 
 
-class ReviewSeal(StrictModel):
-    version: Literal["forecast-review-seal/1"] = "forecast-review-seal/1"
-    manifest_digest: str
-    records: dict[str, str]
+class Override(StrictModel):
+    reason_id: str
+    finding_id: str
+    action: Literal["accept", "dismiss", "edit"]
+    low_pct: float | None = None
+    high_pct: float | None = None
+    actor: str
+    note: str = ""
+    at: datetime

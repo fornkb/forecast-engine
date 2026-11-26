@@ -1,302 +1,274 @@
-"""Offline planner reports from saved review and forecast records."""
+"""Render a saved reasoning run: one self-contained HTML page for managers, plus Markdown/JSON.
+
+Reads only the stored run document, so a report reopens offline at zero cost.
+All text from sources is escaped (article titles are untrusted).
+"""
 
 from __future__ import annotations
 
 from collections import Counter
+from html import escape
 
-from rich.console import Console
-from rich.table import Table
-from rich.text import Text
+from engine.reason.adjust import active
+from engine.reason.schemas import FamilySummary, Finding, ReasonRun
 
-from engine.config.base import StrictModel
-from engine.reason import store as records
-from engine.reason.collect import load_evidence_batch
-from engine.reason.context import get_forecast_snapshot
-from engine.reason.review import load_review
-from engine.reason.schemas import (
-    Assessment,
-    CompanyFact,
-    ContextError,
-    EvidenceBatch,
-    EvidenceRevision,
-    ForecastSnapshot,
-    ReviewManifest,
-    SourceCheck,
-)
-from engine.store.duckdb_store import EngineStore
+TIER_LABEL = {
+    "measured": "Measured in your sales history",
+    "sourced": "Quoted from a source",
+    "judgment": "AI judgment (capped)",
+    "none": "Direction only",
+}
+CHANNEL_LABEL = {"demand": "Demand", "supply_risk": "Supply risk", "cost": "Cost"}
 
 
-class ReviewReport(StrictModel):
-    schema_version: str = "forecast-review-report/1"
-    manifest: ReviewManifest
-    base_batch: EvidenceBatch
-    forecast: ForecastSnapshot
-    assessments: tuple[Assessment, ...]
-    source_checks: tuple[SourceCheck, ...]
-    evidence: tuple[EvidenceRevision, ...]
-    facts: tuple[CompanyFact, ...]
+def _n(value: float | None) -> str:
+    return "–" if value is None else f"{value:,.0f}"
 
 
-def load_report(store: EngineStore, review_id: str) -> ReviewReport:
-    manifest = load_review(store, review_id)
-    base = load_evidence_batch(store, manifest.base_batch_id)
-    forecast = get_forecast_snapshot(store, manifest.snapshot_id)
-    evidence_ids = tuple(dict.fromkeys(base.evidence_ids + manifest.appended_evidence_ids))
-    check_ids = tuple(dict.fromkeys(base.check_ids + manifest.appended_check_ids))
-    fact_ids = sorted(
-        {key for row in forecast.rows for key in row.fact_version_ids}
-        | set(manifest.appended_fact_version_ids)
+def _pct(low: float, high: float) -> str:
+    if low == high == 0:
+        return "no quantity change"
+    return f"{low:+g}% to {high:+g}%"
+
+
+def totals(run: ReasonRun) -> dict:
+    calls = run.calls
+    known = [c.cost for c in calls if c.cost is not None]
+    return {
+        "calls": len(calls),
+        "input_tokens": sum(c.usage.input_tokens for c in calls),
+        "output_tokens": sum(c.usage.output_tokens for c in calls),
+        "cost": round(sum(known), 4) if len(known) == len(calls) else None,
+        "currency": calls[0].currency if calls else "USD",
+    }
+
+
+def _sparkline(family: FamilySummary, width: int = 420, height: int = 120) -> str:
+    """Last 12 months actuals, then the forecast with its ± band, as inline SVG."""
+    history = [value for _, value in family.history]
+    base = [m.baseline for m in family.months]
+    lows = [m.low if m.low is not None else m.baseline for m in family.months]
+    highs = [m.high if m.high is not None else m.baseline for m in family.months]
+    values = [*history, *base, *lows, *highs]
+    top = max(values) if values and max(values) > 0 else 1.0
+    count = len(history) + len(base)
+    step = width / max(1, count - 1)
+
+    def point(index: int, value: float) -> str:
+        return f"{index * step:.1f},{height - 8 - (value / top) * (height - 16):.1f}"
+
+    actual = " ".join(point(i, v) for i, v in enumerate(history))
+    offset = len(history)
+    forecast = " ".join(point(offset + i, v) for i, v in enumerate(base))
+    band = (
+        " ".join(point(offset + i, v) for i, v in enumerate(highs))
+        + " "
+        + " ".join(point(offset + i, v) for i, v in reversed(list(enumerate(lows))))
     )
-    with store.connect() as con:
-        assessments = records.read_assessments(con, store.client_id, review_id)
-        checks = records.read_check_ids(con, store.client_id, check_ids)
-        evidence = records.read_evidence(con, store.client_id, evidence_ids)
-        facts = tuple(records.get_fact(con, store.client_id, key) for key in fact_ids)
-    missing = (
-        *(f"check:{key}" for key in sorted(set(check_ids) - {item.check_id for item in checks})),
-        *(
-            f"evidence:{key}"
-            for key in sorted(set(evidence_ids) - {item.evidence_id for item in evidence})
-        ),
-        *(f"fact:{key}" for key, fact in zip(fact_ids, facts, strict=True) if fact is None),
+    joint = (
+        point(offset - 1, history[-1]) + " " + point(offset, base[0]) if history and base else ""
     )
-    if missing:
-        raise ContextError("Missing pinned revisions " + ", ".join(missing))
-    for row in assessments:
-        if row.manifest_revision != manifest.revision:
-            raise ContextError(
-                f"Assessment {row.scenario_id}/{row.series_id} has a mismatched revision"
-            )
-    return ReviewReport(
-        manifest=manifest,
-        base_batch=base,
-        forecast=forecast,
-        assessments=assessments,
-        source_checks=checks,
-        evidence=evidence,
-        facts=facts,
-    )
-
-
-def _amount(value, unit, *, signed=False) -> str:
-    if value is None:
-        return "unknown"
-    amount = f"{value:+g}" if signed else f"{value:g}"
-    return f"{amount} {unit or 'unit unknown'}"
-
-
-def print_summary(report: ReviewReport, console: Console | None = None) -> None:
-    console = console or Console()
-    manifest = report.manifest
-    console.print(
-        Text(
-            f"Review {manifest.review_id} · {manifest.state} · forecast {manifest.forecast_run_id}"
-        )
-    )
-    console.print(
-        Text(
-            f"Knowledge cutoff {manifest.knowledge_cutoff.isoformat()} · "
-            f"{len(manifest.lookup_attempts)}/{manifest.followup_limit} follow-up attempts · "
-            f"{len(manifest.model_calls)}/{manifest.model_request_limit} model requests"
-        )
-    )
-    counts = Counter(item.finding for item in report.assessments)
-    console.print(
-        Text(
-            f"{len(report.assessments)} findings · "
-            + (
-                ", ".join(
-                    f"{key.replace('_', ' ')} {value}" for key, value in sorted(counts.items())
-                )
-                or "no verified row findings"
-            )
-        )
-    )
-    pending = sum(item.status == "pending" for item in manifest.questions)
-    console.print(
-        Text(f"{pending} pending questions · {len(manifest.gaps)} coverage or review gaps")
-    )
-    if report.assessments:
-        table = Table("Series", "Month", "Target", "Original forecast", "Finding", "Conditions")
-        for row in report.assessments[:8]:
-            conditions = (
-                "\n".join(
-                    f"{item.description[:80]} · {_amount(item.endpoint, row.unit)} "
-                    f"({_amount(item.delta, row.unit, signed=True)})"
-                    for item in row.conditions
-                )
-                or "unknown"
-            )
-            table.add_row(
-                Text(row.series_id),
-                row.period.strftime("%Y-%m"),
-                Text(row.target),
-                _amount(row.forecast_baseline, row.forecast_unit),
-                row.finding.replace("_", " "),
-                Text(conditions),
-            )
-        console.print(table)
-    for gap in manifest.gaps[:5]:
-        console.print(Text(f"  {gap}"))
-
-
-def _plain(value) -> str:
-    clean = " ".join(str(value).split())
     return (
-        clean.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("|", "\\|")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
+        f'<svg viewBox="0 0 {width} {height}" class="spark" role="img" '
+        f'aria-label="Last 12 months and forecast with band">'
+        f'<polygon points="{band}" class="band"/>'
+        f'<polyline points="{actual}" class="actual"/>'
+        f'<polyline points="{joint}" class="joint"/>'
+        f'<polyline points="{forecast}" class="forecast"/></svg>'
     )
 
 
-def render_markdown(report: ReviewReport) -> str:
-    manifest = report.manifest
-    calls = manifest.model_calls
+def _finding_card(finding: Finding, refs: dict) -> str:
+    links = []
+    for key in finding.citations:
+        ref = refs.get(key)
+        if ref is None:
+            continue
+        label = escape(f"{key}: {ref.title[:110]}")
+        if ref.url.startswith(("http://", "https://")):
+            links.append(
+                f'<li><a href="{escape(ref.url)}" rel="noopener noreferrer">{label}</a>'
+                f"{' · ' + escape(ref.source) if ref.source else ''}"
+                f"{' · ' + escape(ref.published) if ref.published else ''}</li>"
+            )
+        else:
+            links.append(f"<li>{label}</li>")
+    months = ", ".join(m.strftime("%b %Y") for m in finding.months)
+    flags = [f for f in finding.flags if f]
+    state = "dismissed" if "dismissed" in finding.flags else ""
+    quote = f"<blockquote>“{escape(finding.quote)}”</blockquote>" if finding.quote else ""
+    carried = (
+        f'<span class="tag muted">unchanged since {escape(finding.carried_from)}</span>'
+        if finding.carried_from
+        else ""
+    )
+    return f"""
+    <div class="finding {finding.channel} {state}">
+      <div class="row"><b>{escape(finding.finding_id)} · {escape(finding.driver_id)}</b>
+        <span class="tag {finding.channel}">{CHANNEL_LABEL[finding.channel]}</span>
+        <span class="tag">{TIER_LABEL[finding.tier]}</span>
+        <span class="tag">confidence {finding.confidence}</span>{carried}</div>
+      <div class="effect">{_pct(finding.low_pct, finding.high_pct)} · {months}</div>
+      <p>{escape(finding.reasoning)}</p>{quote}
+      <ul class="cites">{"".join(links)}</ul>
+      {f'<div class="flags">checks: {escape(", ".join(flags))}</div>' if flags else ""}
+    </div>"""
+
+
+CSS = """
+:root{--ink:#1f2933;--muted:#6b7785;--line:#e3e7ec;--bg:#f7f8fa;--accent:#2563eb;
+--up:#15803d;--down:#b91c1c;--risk:#b45309}
+*{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+color:var(--ink);background:var(--bg)}main{max-width:1060px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:24px;margin:0 0 4px}h2{font-size:19px;margin:28px 0 10px}h3{font-size:16px;margin:0}
+.sub{color:var(--muted)}.banner{background:#fff7e6;border:1px solid #f5d38f;padding:10px 14px;
+border-radius:8px;margin:14px 0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+gap:10px;margin:16px 0}.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px}
+.card b{display:block;font-size:22px}.summary{background:#fff;border-left:4px solid var(--accent);
+padding:12px 16px;border-radius:6px}.family{background:#fff;border:1px solid var(--line);border-radius:12px;
+padding:16px;margin:14px 0}.family-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:10px 0}th,td{text-align:right;
+padding:5px 8px;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}
+.spark{width:100%;max-width:420px;height:120px}.spark .band{fill:#2563eb22}.spark polyline{fill:none;
+stroke-width:2}.spark .actual{stroke:#475569}.spark .forecast,.spark .joint{stroke:var(--accent);
+stroke-dasharray:5 4}.finding{border:1px solid var(--line);border-left:4px solid var(--up);border-radius:8px;
+padding:10px 12px;margin:10px 0}.finding.supply_risk,.finding.cost{border-left-color:var(--risk)}
+.finding.dismissed{opacity:.5}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tag{font-size:12px;background:#eef2f7;border-radius:999px;padding:2px 8px}.tag.muted{color:var(--muted)}
+.effect{font-weight:600;margin:6px 0}.cites{margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--muted)}
+.flags{font-size:12px;color:var(--muted)}blockquote{margin:6px 0;padding-left:10px;border-left:3px solid var(--line);
+color:var(--muted)}.quiet li,.gaps li{margin:3px 0}footer{margin-top:30px;color:var(--muted);font-size:13px}
+"""
+
+
+def _sources(run: ReasonRun) -> str:
+    items = []
+    for ref in run.references:
+        if ref.kind == "previous":
+            continue
+        label = escape(f"{ref.id} [{ref.driver_id}] {ref.title[:140]}")
+        meta = " · ".join(escape(part) for part in (ref.source, ref.published) if part)
+        if ref.url.startswith(("http://", "https://")):
+            label = f'<a href="{escape(ref.url)}" rel="noopener noreferrer">{label}</a>'
+        items.append(f"<li>{label}{' · ' + meta if meta else ''}</li>")
+    return "".join(items)
+
+
+def render_html(run: ReasonRun) -> str:
+    refs = {ref.id: ref for ref in run.references}
+    used = totals(run)
+    findings_by_family: dict[str, list[Finding]] = {}
+    for finding in run.findings:
+        findings_by_family.setdefault(finding.family_id, []).append(finding)
+    counts = Counter(f.channel for f in run.findings if "dismissed" not in f.flags)
+    changed = [d.driver_id for d in run.drivers if d.status == "changed"]
+    cost_text = (
+        "unknown (set reasoning.llm.rates)"
+        if used["cost"] is None
+        else f"{used['cost']:.4f} {used['currency']}"
+    )
+    sections = []
+    for family in run.families:
+        items = findings_by_family.get(family.family_id, [])
+        rows = "".join(
+            f"<tr><td>{m.period:%b %Y}</td><td>{_n(m.last_year)}</td><td>{_n(m.baseline)}</td>"
+            f"<td>{_n(m.p10)} – {_n(m.p90)}</td><td><b>{_n(m.low)} – {_n(m.high)}</b></td></tr>"
+            for m in family.months
+        )
+        cards = "".join(_finding_card(f, refs) for f in items) or (
+            '<p class="sub">No external driver changes this family\'s forecast this month.</p>'
+        )
+        moved = any(active(f) for f in items)
+        sections.append(f"""
+  <section class="family">
+    <div class="family-head"><div><h3>{escape(family.name)}</h3>
+      <div class="sub">{family.series_count} SKUs · {"band applied" if moved else "forecast unchanged"}</div></div>
+      {_sparkline(family)}</div>
+    <table><tr><th>Month</th><th>Same month last year</th><th>Forecast</th>
+      <th>Model range (p10–p90)</th><th>What-if band</th></tr>{rows}</table>
+    {cards}
+  </section>""")
+    quiet = "".join(f"<li><b>{escape(q.driver_id)}</b>: {escape(q.reason)}</li>" for q in run.quiet)
+    unchanged = [d.driver_id for d in run.drivers if d.status == "unchanged"]
+    if unchanged:
+        quiet += (
+            f"<li><b>{escape(', '.join(unchanged))}</b>: no new information since the last "
+            "run; earlier findings carried forward at no cost.</li>"
+        )
+    gaps = "".join(f"<li>{escape(g)}</li>" for g in [*run.not_assessed, *run.gaps])
+    banner = (
+        f'<div class="banner"><b>Scenario data.</b> {escape(run.scenario)}. Signals in this '
+        "report are illustrative, prepared for a demonstration, not live news.</div>"
+        if run.scenario
+        else ""
+    )
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forecast reasoning · {escape(run.client_id)} · {run.as_of:%b %Y}</title><style>{CSS}</style></head>
+<body><main>
+  <h1>External factors and the forecast</h1>
+  <div class="sub">{escape(run.client_id)} · forecast run {run.forecast_run_id} · reviewed {run.as_of:%d %b %Y}
+   · months {run.months[0]:%b %Y} – {run.months[-1]:%b %Y}</div>
+  {banner}
+  <div class="cards">
+    <div class="card"><b>{len(run.drivers)}</b>drivers checked</div>
+    <div class="card"><b>{len(changed)}</b>with new information</div>
+    <div class="card"><b>{counts.get("demand", 0)}</b>demand findings</div>
+    <div class="card"><b>{counts.get("supply_risk", 0) + counts.get("cost", 0)}</b>supply / cost alerts</div>
+    <div class="card"><b>{used["calls"]}</b>AI calls · {used["input_tokens"] + used["output_tokens"]:,} tokens</div>
+  </div>
+  {f'<div class="summary">{escape(run.summary)}</div>' if run.summary else ""}
+  <h2>By product family</h2>
+  <p class="sub">The what-if band shows the forecast under the stated conditions. It is not a
+  probability range; the model range (p10–p90) is the forecasting model's own uncertainty.</p>
+  {"".join(sections)}
+  <h2>Checked, no change</h2><ul class="quiet">{quiet or "<li>–</li>"}</ul>
+  <h2>Gaps and limits</h2><ul class="gaps">{gaps or "<li>None</li>"}</ul>
+  <h2>Sources checked</h2><ul class="cites">{_sources(run) or "<li>–</li>"}</ul>
+  <footer>Run {escape(run.reason_id)} · {escape(run.provider)} {escape(run.model or "")} ·
+   prompt {escape(run.prompt_version)} · cost {escape(cost_text)} · AI proposes, Python checks every
+   number against its evidence tier and computes the bands.</footer>
+</main></body></html>"""
+
+
+def render_markdown(run: ReasonRun) -> str:
+    used = totals(run)
     lines = [
-        "# Monthly forecast review",
+        f"# External factors · {run.client_id} · {run.as_of:%d %b %Y}",
         "",
-        f"Client **{_plain(manifest.client_id)}**, forecast run **{manifest.forecast_run_id}**",
-        f"Review `{manifest.review_id}` · revision {manifest.revision} · {manifest.state}",
-        f"Base batch `{manifest.base_batch_id}`",
-        f"Collection cutoff {manifest.collection_cutoff.isoformat()}",
-        f"Review knowledge cutoff {manifest.knowledge_cutoff.isoformat()}",
-        f"Follow-up attempts {len(manifest.lookup_attempts)}/{manifest.followup_limit} · "
-        f"model requests {len(calls)}/{manifest.model_request_limit} · "
-        f"input tokens {sum(call.input_tokens for call in calls)} · "
-        f"output tokens {sum(call.output_tokens for call in calls)}",
+        f"Forecast run {run.forecast_run_id} · run `{run.reason_id}` · {used['calls']} AI calls · "
+        f"{used['input_tokens'] + used['output_tokens']:,} tokens · cost "
+        f"{'unknown' if used['cost'] is None else used['cost']}",
     ]
-    if manifest.successor_of:
-        lines.append(f"Successor of `{manifest.successor_of}`")
-    lines.extend(["", "## Monthly findings", ""])
-    assumptions = {item.assumption_id: item for item in manifest.assumptions}
-    for row in report.assessments:
-        product = _plain(row.item_id or row.series_id)
-        customer = _plain(row.customer_id or "unknown customer")
-        lines.extend(
-            [
-                f"### {product} · {customer} · {row.period:%Y-%m}",
+    if run.scenario:
+        lines += ["", f"> Scenario data: {run.scenario}. Illustrative, not live news."]
+    if run.summary:
+        lines += ["", run.summary]
+    for family in run.families:
+        lines += [
+            "",
+            f"## {family.name} ({family.series_count} SKUs)",
+            "",
+            "| Month | Last year | Forecast | What-if band |",
+            "|---|---:|---:|---:|",
+        ]
+        lines += [
+            f"| {m.period:%b %Y} | {_n(m.last_year)} | {_n(m.baseline)} | "
+            f"{_n(m.low)} – {_n(m.high)} |"
+            for m in family.months
+        ]
+        for finding in [f for f in run.findings if f.family_id == family.family_id]:
+            lines += [
                 "",
-                f"Series {_plain(row.series_id)} · target {_plain(row.target)} · "
-                f"horizon {row.horizon} · model {_plain(row.model)} · "
-                f"original forecast {_amount(row.forecast_baseline, row.forecast_unit)}",
-                f"**{row.finding.replace('_', ' ')}** · direction {row.direction}",
-                _plain(row.rationale),
+                f"- **{finding.finding_id} {finding.driver_id}** · "
+                f"{CHANNEL_LABEL[finding.channel]} · {_pct(finding.low_pct, finding.high_pct)}"
+                f" · {TIER_LABEL[finding.tier]} · {finding.reasoning} "
+                f"(cites {', '.join(finding.citations) or 'none'})",
             ]
-        )
-        if row.supply_at or row.supply_shortfall is not None:
-            lines.append(
-                f"Supply shortfall {_amount(row.supply_shortfall, row.supply_unit)} "
-                f"at {row.supply_at.isoformat() if row.supply_at else 'unknown date'}"
-            )
-        if row.supply_balance is not None:
-            lines.append(
-                f"Projected material balance at the site "
-                f"{_amount(row.supply_balance, row.supply_unit)}"
-            )
-        if row.method_id:
-            lines.append(f"Method `{row.method_id}` · `{row.method_version}`")
-        if row.assumption_id:
-            source = assumptions[row.assumption_id]
-            lines.append(
-                f"Conditional planner assumption by **{_plain(source.actor)}**, "
-                f"confirmed {source.confirmed_at.isoformat()}. {_plain(source.values.rationale)}"
-            )
-        if not row.conditions:
-            lines.append("Scenario quantities unknown.")
-        for condition in row.conditions:
-            lines.extend(
-                [
-                    "",
-                    f"- {_plain(condition.description)} · "
-                    f"**{_amount(condition.endpoint, row.unit)}** "
-                    f"({_amount(condition.delta, row.unit, signed=True)}) "
-                    f"· condition `{_plain(condition.condition_id)}`",
-                ]
-            )
-            for operand in condition.operands:
-                lines.append(
-                    f"  - {_plain(operand.name)} {_amount(operand.value, operand.unit)} · "
-                    f"`{operand.record_version_id}` · {_plain(operand.basis)}"
-                )
-            if condition.basis_record_ids:
-                lines.append(
-                    "  - Condition references "
-                    + ", ".join(f"`{key}`" for key in condition.basis_record_ids)
-                )
-        citations = (*row.evidence_ids, *row.fact_version_ids)
-        if citations:
-            lines.extend(["", "Citations " + ", ".join(f"`{key}`" for key in citations)])
-        if row.contrary_ids:
-            lines.append("Contrary records " + ", ".join(f"`{key}`" for key in row.contrary_ids))
-        if row.required_check_ids:
-            lines.append(
-                "Required checks " + ", ".join(f"`{key}`" for key in row.required_check_ids)
-            )
-        if row.gaps:
-            lines.extend(["", *[f"- {_plain(gap)}" for gap in row.gaps]])
-        lines.append("")
-    covered = {(row.series_id, row.period) for row in report.assessments}
-    missing = [row for row in report.forecast.rows if (row.series_id, row.period) not in covered]
-    if missing:
-        lines.extend(["### Rows without a verified finding", ""])
-        for row in missing:
-            lines.append(
-                f"- {_plain(row.series_id)} · {row.period:%Y-%m} · "
-                f"original forecast {_amount(row.baseline, row.unit)}"
-            )
-    lines.extend(["", "## News mapping decisions", ""])
-    for mapping in manifest.mappings:
-        lines.append(f"- **{mapping.status}** · `{mapping.event_id}` · {_plain(mapping.basis)}")
-        lines.append("  - Articles " + ", ".join(f"`{key}`" for key in mapping.article_ids))
-        if mapping.entities:
-            lines.append(
-                "  - Entities "
-                + ", ".join(f"{_plain(item.type)} {_plain(item.id)}" for item in mapping.entities)
-            )
-        if mapping.months:
-            lines.append(
-                "  - Months " + ", ".join(month.strftime("%Y-%m") for month in mapping.months)
-            )
-        references = (*mapping.fact_version_ids, *mapping.evidence_ids, *mapping.question_ids)
-        if references:
-            lines.append("  - References " + ", ".join(f"`{key}`" for key in references))
-    lines.extend(["", "## Operator questions", ""])
-    for question in manifest.questions:
-        lines.append(
-            f"- **{question.status}** · `{question.question_id}` · {_plain(question.message)}"
-        )
-        if question.scope:
-            for series, baseline in question.baselines:
-                lines.append(
-                    f"  - {_plain(series)} · {question.scope.period:%Y-%m} · "
-                    f"{_amount(baseline, question.scope.unit)}"
-                )
-    lines.extend(["", "## Coverage and source checks", ""])
-    lines.extend(f"- {_plain(gap)}" for gap in manifest.gaps)
-    for check in report.source_checks:
-        lines.append(
-            f"- `{check.check_id}` · {_plain(check.scope.source_id)} · "
-            f"{check.status} · {check.coverage} · {check.ended_at.isoformat()}"
-            + (f" · {_plain(check.reason)}" if check.reason else "")
-        )
-        for month in check.months:
-            lines.append(
-                f"  - {month.period:%Y-%m} · {month.status}"
-                + (f" · {_plain(month.reason)}" if month.reason else "")
-            )
-    lines.extend(["", "## Evidence and company facts", ""])
-    for item in report.evidence:
-        title = item.news.title if item.news else item.source_id
-        lines.append(
-            f"- `{item.evidence_id}` · {_plain(title)} · "
-            f"available {item.first_known_at.isoformat()} · {_plain(item.source_ref)}"
-        )
-    for fact in report.facts:
-        lines.append(
-            f"- `{fact.fact_version_id}` · {_plain(fact.subject.id)} "
-            f"{_plain(fact.relation)} · {_plain(fact.source_ref)}"
-        )
-    return "\n".join(lines).rstrip() + "\n"
+    lines += ["", "## Checked, no change", ""]
+    lines += [f"- {q.driver_id}: {q.reason}" for q in run.quiet] or ["- none"]
+    if run.not_assessed or run.gaps:
+        lines += ["", "## Gaps", ""] + [f"- {g}" for g in [*run.not_assessed, *run.gaps]]
+    lines += ["", "## Sources", ""]
+    lines += [f"- {r.id}: {r.title} {r.url}".rstrip() for r in run.references]
+    return "\n".join(lines) + "\n"

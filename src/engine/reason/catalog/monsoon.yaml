@@ -1,0 +1,10 @@
+id: monsoon
+kind: weather
+description: Monsoon outlook for a region from seasonal model data and monsoon news.
+connectors: [weather, news]
+news_query: 'monsoon forecast {region_name}'
+required_params: [region]
+mechanism_hint: >-
+  Monsoon timing and strength move construction activity, agriculture, logistics and
+  seasonal consumption. The normal seasonal dip is already in the forecast; only an
+  unusual monsoon is new information.

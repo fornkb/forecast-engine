@@ -1,0 +1,112 @@
+{
+  "name": "AquaPure: strong El Niño heading into summer 2027",
+  "as_of": "2026-11-26",
+  "note": "illustrative signals for a demonstration. The ENSO status mirrors the NOAA CPC discussion of 12 Nov 2026; weather values and all articles are invented for the scenario",
+  "drivers": {
+    "el_nino": [
+      {
+        "kind": "enso",
+        "summary": "NOAA CPC ENSO discussion issued 2026-11-12: status 'El Niño Advisory'. El Niño continues to strengthen, with a strong-to-very strong El Niño likely through January-March 2027 (remaining greater than a 79% chance).",
+        "data": {"issue_date": "2026-11-12", "status": "El Niño Advisory"},
+        "source_ref": "https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/enso_advisory/ensodisc.shtml"
+      },
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/imd-warm-premonsoon-2027",
+            "title": "[Scenario] IMD expects a warmer-than-normal pre-monsoon season as strong El Niño persists",
+            "source": "scenario.example",
+            "published": "2026-11-20T06:00:00Z",
+            "snippet": "Above-normal temperatures are likely over central and western India from March to May 2027, with more heatwave days than usual in Maharashtra and Gujarat."
+          },
+          {
+            "url": "https://scenario.example/monsoon-2027-risk",
+            "title": "[Scenario] Strong El Niño raises the risk of a weak 2027 monsoon, say forecasters",
+            "source": "scenario.example",
+            "published": "2026-11-18T09:30:00Z",
+            "snippet": "Past strong El Niño years were often followed by below-normal monsoon rainfall, although the Indian Ocean Dipole can offset part of the effect."
+          }
+        ]
+      }
+    ],
+    "pune_weather": [
+      {
+        "kind": "weather",
+        "summary": "Pune and Western Maharashtra seasonal outlook (scenario values; ECMWF SEAS5 mean, regional, not bias-corrected; normal = 10-yr archive): 2026-11: 24.4°C (+0.5 vs normal), rain 9 mm vs normal 14 mm; 2026-12: 22.9°C (+0.6 vs normal), rain 3 mm vs normal 4 mm; 2027-01: 22.6°C (+0.7 vs normal), rain 1 mm vs normal 2 mm; 2027-02: 25.1°C (+0.9 vs normal), rain 0 mm vs normal 1 mm; 2027-03: 29.0°C (+1.2 vs normal), rain 1 mm vs normal 3 mm; 2027-04: 31.6°C (+1.4 vs normal), rain 3 mm vs normal 8 mm",
+        "data": {
+          "region": "pune",
+          "months": [
+            {"period": "2026-11", "coverage": "complete", "temp_c": 24.4, "temp_anomaly_c": 0.5, "rain_mm": 9, "rain_normal_mm": 14},
+            {"period": "2026-12", "coverage": "complete", "temp_c": 22.9, "temp_anomaly_c": 0.6, "rain_mm": 3, "rain_normal_mm": 4},
+            {"period": "2027-01", "coverage": "complete", "temp_c": 22.6, "temp_anomaly_c": 0.7, "rain_mm": 1, "rain_normal_mm": 2},
+            {"period": "2027-02", "coverage": "complete", "temp_c": 25.1, "temp_anomaly_c": 0.9, "rain_mm": 0, "rain_normal_mm": 1},
+            {"period": "2027-03", "coverage": "complete", "temp_c": 29.0, "temp_anomaly_c": 1.2, "rain_mm": 1, "rain_normal_mm": 3},
+            {"period": "2027-04", "coverage": "complete", "temp_c": 31.6, "temp_anomaly_c": 1.4, "rain_mm": 3, "rain_normal_mm": 8}
+          ]
+        }
+      }
+    ],
+    "heatwave": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/maharashtra-heat-action-2027",
+            "title": "[Scenario] Maharashtra districts start heat action plans early for summer 2027",
+            "source": "scenario.example",
+            "published": "2026-11-22T05:00:00Z",
+            "snippet": "Officials cited the El Niño outlook and asked municipalities to prepare drinking-water kiosks from March."
+          }
+        ]
+      }
+    ],
+    "pet_resin": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/pet-resin-prices-nov",
+            "title": "[Scenario] PET resin prices in India rise about 8% on firmer crude and tight supply",
+            "source": "scenario.example",
+            "published": "2026-11-15T08:00:00Z",
+            "snippet": "Converters said domestic PET resin prices rose about 8% in November and may stay high through the first quarter of 2027."
+          }
+        ]
+      }
+    ],
+    "crude_oil": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/tanker-attacks-brent",
+            "title": "[Scenario] Tanker attacks in a key shipping lane push Brent crude up 6% in a week",
+            "source": "scenario.example",
+            "published": "2026-11-24T11:00:00Z",
+            "snippet": "Freight and insurance costs rose as some tankers rerouted; analysts expect higher prices for oil-based plastics if disruption lasts."
+          }
+        ]
+      }
+    ],
+    "packaging_rules": [
+      {
+        "kind": "news",
+        "summary": "scenario articles",
+        "articles": [
+          {
+            "url": "https://scenario.example/recycled-pet-draft-2028",
+            "title": "[Scenario] Draft rule proposes higher recycled content in PET bottles from 2028",
+            "source": "scenario.example",
+            "published": "2026-11-10T07:00:00Z",
+            "snippet": "The proposal is open for comments until February 2027 and would apply from April 2028."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -93,3 +93,20 @@ cost_model:
   shortage_cost_per_unit: 9.0
   lead_time_periods: 1
   review_period_periods: 1
+
+# The reasoning layer (external factors and a ± band). The company profile is in
+# config/profiles/teknic_mumbai.yaml; demo scenario: data/demo/scenarios/teknic_copper.json.
+reasoning:
+  enabled: true
+  timezone: Asia/Kolkata
+  llm:
+    provider: openai # openai | anthropic | gemini
+    model: gpt-6.2-sol
+    triage_model: gpt-6-luna
+    effort: low
+    rates:
+      gpt-6.2-sol: {input_per_m: 2.0, output_per_m: 10.0}
+      gpt-6-luna: {input_per_m: 0.1, output_per_m: 0.5}
+    recordings_dir: data/demo/recordings/teknic_mumbai
+  sources:
+    news: {provider: gdelt, lookback_days: 30, max_articles_per_driver: 6, source_country: india}

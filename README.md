@@ -13,9 +13,12 @@ data it wins neither, and a pooled gradient-boosted model beats it everywhere �
 see [What M5 changed](#14-what-m5-changed). The contrast between those two
 results is the most useful thing this project has produced so far.
 
-There are still **no LLMs and no agents** here. Chronos-2 is a pretrained
-forecasting model, not a language model; the LLM-driven context and explanation
-layers belong to later phases.
+Chronos-2 is a pretrained forecasting model, not a language model. The
+**reasoning layer** is the one place a language model is used: it reads external
+factors (El Niño, weather, commodity prices, festivals, policy and conflict news)
+and shows a what-if band with reasoning beside a saved forecast, typically in 0–2
+model calls a month. It never changes the stored forecast. See
+[docs/reasoning.md](docs/reasoning.md) and [section 19](#19-the-reasoning-layer).
 
 Every model is scored against a seasonal-naive baseline on a rolling-origin
 backtest, so added sophistication has to prove itself rather than be assumed.
@@ -47,6 +50,7 @@ backtest, so added sophistication has to prove itself rather than be assumed.
 16. [Publishing forecasts back](#16-publishing-forecasts-back)
 17. [The decision layer](#17-the-decision-layer)
 18. [Forecast horizons](#18-forecast-horizons)
+19. [The reasoning layer](#19-the-reasoning-layer)
 
 ---
 
@@ -1487,3 +1491,27 @@ raw traceback.
 - **No `quarterly` or `yearly` granularity.**
 - **One decision object.** Reorder points suit execution; a strategic tier needs
   a volume or capacity envelope instead.
+
+---
+
+## 19. The reasoning layer
+
+An optional layer that adds external context to a saved monthly forecast. It
+answers "what outside this company's sales history could move these numbers, and
+by how much?" It does this for any company through configuration: a `reasoning:`
+section in the client profile and a company profile in `config/profiles/`.
+
+```powershell
+pip install -e ".[openai]"          # or .[anthropic] / .[gemini]
+python scripts/make_demo_water.py   # synthetic packaged-water company
+engine ingest   --client demo_aquapure --file data/demo/aquapure_sales.csv
+engine features --client demo_aquapure
+engine backtest --client demo_aquapure
+engine forecast --client demo_aquapure --horizon 6
+engine reason   --client demo_aquapure --scenario data/demo/scenarios/aquapure_el_nino.json --dry-run
+```
+
+`--dry-run` shows the drivers, what changed and the estimated cost without calling a
+model. Design, cost model, customization and the full runbook are in
+[docs/reasoning.md](docs/reasoning.md).
+

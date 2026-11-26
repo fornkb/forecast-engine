@@ -1,0 +1,82 @@
+# Company profile for the Teknic demo data (electrical control components, Mumbai).
+# Family meanings and inputs are DEMO ASSUMPTIONS read from item descriptions; in a
+# real onboarding `engine reason-onboard` drafts this and the admin confirms it.
+status: draft
+company:
+  name: Teknic Mumbai (demo)
+  summary: >-
+    Makes 22.5 mm push buttons, selector switches, pilot lamps, enclosures and medium-voltage
+    fuse gear, plus moulded plastic parts, sold to electrical distributors and panel builders
+    from a Mumbai plant.
+  regions:
+    - {id: mumbai, name: Mumbai and Maharashtra, country: IN, latitude: 19.07, longitude: 72.88}
+families:
+  - id: control_devices
+    name: Push buttons, switches and pilot lamps
+    match: {item_group: [FGAC, FGPL, FGPB, FGEL]}
+    inputs: [polycarbonate, copper and brass contacts, LEDs]
+    regions: [mumbai]
+    customers: electrical distributors, panel builders
+  - id: enclosures
+    name: Enclosures and control stations
+    match: {item_group: [FGES]}
+    inputs: [ABS and polycarbonate]
+    regions: [mumbai]
+    customers: panel builders, contractors
+  - id: fuse_gear
+    name: Medium-voltage fuse gear (12-36 kV)
+    match: {item_group: [FGXL]}
+    inputs: [copper, porcelain and epoxy]
+    regions: [mumbai]
+    customers: utilities and switchgear makers
+  - id: moulded_parts
+    name: Moulded parts and components
+    match: {item_group: [PM00, P000, K000, E000]}
+    inputs: [polycarbonate, ABS, purchased connectors]
+    regions: [mumbai]
+    customers: internal assembly and OEMs
+  - id: unclassified_fg
+    name: Mumbai finished goods (item group not given)
+    match: {item_group: [UNSPECIFIED]}
+    regions: [mumbai]
+drivers:
+  - id: copper
+    template: commodity_news
+    families: [control_devices, fuse_gear]
+    mechanism: >-
+      Copper and brass contacts are a large share of material cost; a copper spike squeezes
+      margin and may lead to price increases that slow distributor orders.
+    params: {commodity: copper}
+  - id: plastics
+    template: commodity_news
+    families: [control_devices, enclosures, moulded_parts]
+    mechanism: Polycarbonate and ABS price moves change moulding cost.
+    params: {commodity: polycarbonate}
+  - id: diwali
+    template: festival
+    families: [control_devices, enclosures, unclassified_fg]
+    mechanism: >-
+      Distributors stock up before Diwali and pause during the festival week, so the month that
+      holds Diwali shifts orders compared with last year.
+    params: {festival: Diwali}
+  - id: monsoon
+    template: monsoon
+    families: ["*"]
+    mechanism: >-
+      Heavy or late monsoon rain slows construction and panel installation, delaying orders.
+    params: {region: mumbai}
+  - id: import_duty
+    template: policy_news
+    families: ["*"]
+    mechanism: Import duty changes on electrical components alter competition from imports.
+    params: {topic: import duty electrical components}
+  - id: construction
+    template: market_news
+    families: [control_devices, enclosures, unclassified_fg]
+    mechanism: Housing and commercial construction drive demand for control panels.
+    params: {topic: real estate construction}
+open_questions:
+  - What do item groups FGEL and UNSPECIFIED contain?
+  - Which raw materials matter most by cost (copper, polycarbonate, ABS)?
+  - Do any customers have contracted volumes or price-escalation clauses?
+notes: "Demo assumptions; confirm with the Teknic admin."

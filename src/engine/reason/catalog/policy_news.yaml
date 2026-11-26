@@ -1,0 +1,9 @@
+id: policy_news
+kind: policy
+description: Regulation, tax, duty or government-scheme news that affects the company's products or customers.
+connectors: [news]
+news_query: '{topic} {country_name}'
+required_params: [topic]
+mechanism_hint: >-
+  Tax, duty or rule changes alter prices, imports or what customers may buy. Look for
+  an effective date and whether the change is confirmed or only proposed.

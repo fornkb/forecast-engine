@@ -1,0 +1,70 @@
+# Company profile for the synthetic AquaPure demo. In a real deployment this file is
+# drafted by `engine reason-onboard` from ERP data and then corrected by the admin.
+status: confirmed
+company:
+  name: AquaPure Beverages (demo)
+  summary: >-
+    Bottles packaged drinking water and flavoured water at a plant near Pune and sells
+    to distributors, retail chains, hotels and offices across Western Maharashtra.
+  regions:
+    - {id: pune, name: Pune and Western Maharashtra, country: IN, latitude: 18.52, longitude: 73.86}
+families:
+  - id: pet_bottles
+    name: PET bottled water (500 ml, 1 L, 2 L)
+    match: {item_group: [PETBTL]}
+    inputs: [PET resin, groundwater, caps and labels]
+    regions: [pune]
+    customers: distributors, retail chains, hotels
+  - id: jars_20l
+    name: 20 litre returnable jars
+    match: {item_group: [JAR20]}
+    inputs: [groundwater, polycarbonate jars]
+    regions: [pune]
+    customers: offices and homes
+  - id: flavoured
+    name: Flavoured water
+    match: {item_group: [FLAV]}
+    inputs: [PET resin, sugar, flavours]
+    regions: [pune]
+    customers: retail chains, hotels
+drivers:
+  - id: el_nino
+    template: enso
+    families: ["*"]
+    mechanism: >-
+      A strong El Niño tends to weaken India's monsoon and heat the pre-monsoon months,
+      which lifts bottled-water demand in March-May and can strain groundwater for production.
+    params:
+      analog_periods: ["2024-03", "2024-04", "2024-05"]
+      analog_label: the 2024 spring after the last El Niño
+  - id: pune_weather
+    template: seasonal_weather
+    families: ["*"]
+    mechanism: Hotter and drier months raise water demand; heavy rain lowers it.
+    params: {region: pune}
+  - id: heatwave
+    template: heatwave
+    families: [pet_bottles, flavoured]
+    mechanism: Heatwaves lift on-the-go bottled and flavoured water sales within days.
+    params: {region: pune}
+  - id: pet_resin
+    template: commodity_news
+    families: [pet_bottles, flavoured]
+    mechanism: >-
+      PET resin is the main packaging cost; a price spike raises cost and may lead to a
+      price increase, but rarely changes demand in the same month.
+    params: {commodity: PET resin}
+  - id: crude_oil
+    template: geopolitics_news
+    families: [pet_bottles, flavoured]
+    mechanism: >-
+      Conflict that disrupts oil supply raises PET resin and diesel freight costs (cost and
+      supply risk) before it affects demand.
+    params: {topic: '"crude oil" supply disruption'}
+  - id: packaging_rules
+    template: policy_news
+    families: [pet_bottles, flavoured]
+    mechanism: Plastic and recycling rules can raise packaging cost or restrict bottle sizes.
+    params: {topic: plastic bottle rules}
+open_questions: []
+notes: ""
