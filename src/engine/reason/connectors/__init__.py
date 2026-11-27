@@ -33,8 +33,9 @@ CONNECTORS: dict[str, Connector] = {
     "weather": weather.fetch,
     "enso": enso.fetch,
     "calendar": calendar.fetch,
+    "scan": news.scan,
 }
 # Connectors that call the internet; a scenario pack replaces exactly these.
-NETWORK = {"news", "weather", "enso"}
+NETWORK = {"news", "weather", "enso", "scan"}
 
 __all__ = ["CONNECTORS", "NETWORK", "Context", "ProviderError", "http_get"]

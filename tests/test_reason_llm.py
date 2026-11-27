@@ -14,7 +14,12 @@ from engine.reason.llm.cost import cost
 from engine.reason.llm.replay import ReplayClient
 from engine.reason.schemas import ProfileDraftOut, ReasoningOut, Usage
 
-ANSWER = {"summary": "s", "findings": [], "no_change": [{"driver_id": "d", "reason": "r"}]}
+ANSWER = {
+    "summary": "s",
+    "findings": [],
+    "new_factors": [],
+    "no_change": [{"driver_id": "d", "reason": "r"}],
+}
 
 
 def _walk(node):

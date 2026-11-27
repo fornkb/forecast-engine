@@ -39,3 +39,6 @@ class ScenarioPack:
             for item in self._drivers.get(driver_id, [])
             if item.get("kind") == kind
         ]
+
+    def has(self, driver_id: str) -> bool:
+        return bool(self._drivers.get(driver_id))

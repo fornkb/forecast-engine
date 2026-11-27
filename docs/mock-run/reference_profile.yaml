@@ -1,0 +1,84 @@
+# Haveli Harvest Oils: REFERENCE company profile (the answer key).
+#
+# Not used by the engine. In the mock run the AI drafts its own profile from the ERP data and
+# the manager's answers; compare that draft with this file afterwards. If onboarding fails and
+# you still want to run a review, copy this file to config/profiles/demo_haveliharvest.yaml.
+status: confirmed
+company:
+  name: Haveli Harvest Oils Pvt. Ltd. (fictional)
+  summary: >-
+    Regional edible-oil packer in North India. Crushes mustard seed in its own expeller unit
+    and refines and packs imported crude soybean, palm and sunflower oil, plus domestic rice
+    bran oil and vanaspati. Sells through distributors, one modern-trade chain and sweet
+    shops/caterers across Rajasthan, Delhi NCR, Haryana and Uttar Pradesh.
+  regions:
+    - {id: north_india, name: "Delhi NCR and Rajasthan", country: IN, latitude: 28.61, longitude: 77.21}
+families:
+  - {id: mustard_oil, name: Kachi ghani mustard oil, match: {item_group: [MUST]}, inputs: [mustard seed], regions: [north_india]}
+  - {id: imported_soft_oils, name: Soybean and sunflower oil, match: {item_group: [SOYA, SUNF]}, inputs: [crude soybean oil, crude sunflower oil], regions: [north_india]}
+  - {id: palm_and_vanaspati, name: Palmolein and vanaspati, match: {item_group: [PALM, VANA]}, inputs: [crude palm oil, palm stearin], regions: [north_india]}
+  - {id: rice_bran_oil, name: Rice bran oil, match: {item_group: [RICE]}, inputs: [crude rice bran oil], regions: [north_india]}
+drivers:
+  - id: import_duty
+    template: policy_news
+    families: [imported_soft_oils, palm_and_vanaspati, mustard_oil]
+    mechanism: >-
+      Import duty changes on crude edible oils move shelf prices within weeks; dearer imported
+      oils cut their volumes and push some buyers to mustard oil.
+    params:
+      topic: edible oil import duty
+      analog_periods: ["2024-10", "2024-11", "2024-12", "2025-01"]
+      analog_label: the months after the Sep 2024 duty hike
+  - id: palm_oil
+    template: commodity_news
+    families: [palm_and_vanaspati]
+    mechanism: Crude palm oil prices (Indonesia, Malaysia) set palmolein and vanaspati costs and shelf prices.
+    params: {commodity: palm oil}
+  - id: soybean_oil
+    template: commodity_news
+    families: [imported_soft_oils]
+    mechanism: Soybean oil prices (Argentina, Brazil, US biofuel demand) set soybean oil costs and shelf prices.
+    params: {commodity: soybean oil}
+  - id: black_sea_sunflower
+    template: geopolitics_news
+    families: [imported_soft_oils]
+    mechanism: War and shipping risk in the Black Sea can cut sunflower oil supply and raise its price.
+    params: {topic: sunflower oil Black Sea exports}
+  - id: shipping_routes
+    template: geopolitics_news
+    families: [imported_soft_oils, palm_and_vanaspati]
+    mechanism: Red Sea and Suez disruption raises freight and delays Black Sea cargoes to Kandla.
+    params: {topic: Red Sea shipping disruption}
+  - id: mustard_crop
+    template: commodity_news
+    families: [mustard_oil]
+    mechanism: The rabi mustard crop (sown Oct-Nov, harvested Mar-Apr) sets mustard seed prices for the year.
+    params: {commodity: mustard seed}
+  - id: winter_weather
+    template: seasonal_weather
+    families: [mustard_oil]
+    mechanism: Colder winters in North India lift household mustard oil use; a warm winter softens it.
+    params:
+      region: north_india
+      analog_periods: ["2024-01"]
+      analog_label: the January 2024 cold wave
+  - id: el_nino
+    template: enso
+    families: [palm_and_vanaspati, imported_soft_oils]
+    mechanism: El Niño dries Southeast Asia and can cut palm oil output 6-12 months later, raising palm prices.
+  - id: diwali
+    template: festival
+    families: ["*"]
+    mechanism: Households and sweet shops buy oil in the three weeks before Diwali.
+    params: {festival: Diwali}
+  - id: holi
+    template: festival
+    families: ["*"]
+    mechanism: Frying and sweets before Holi lift oil demand, most of all in caterer tins.
+    params: {festival: Holi}
+open_questions: []
+scan:
+- edible oil prices India
+- mustard oil
+- palm oil soybean oil imports India
+notes: Reference answer key written with the sample data; not produced by the AI.

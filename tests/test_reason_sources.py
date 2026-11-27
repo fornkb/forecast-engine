@@ -219,6 +219,7 @@ def test_onboarding_draft_is_checked_and_saved(tmp_path):
         {
             "company_name": "TestWater",
             "summary": "Water.",
+            "scan_topics": ["bottled water India"],
             "questions": ["What is JR?"],
             "regions": [{"id": "r1", "name": "R", "country": "IN", "latitude": 1, "longitude": 2}],
             "families": [
@@ -279,3 +280,35 @@ def test_onboarding_draft_is_checked_and_saved(tmp_path):
     path = save_profile(client, store, profile, "admin")
     assert path.exists() and load_profile(client).open_questions == ["What is JR?"]
     assert from_draft(draft, load_catalog(), {"BTL"}).status == "draft"
+
+
+def test_gdelt_live_requests_are_paced_and_retried_after_429(monkeypatch):
+    """GDELT allows one request every ~5 s; a 429 is retried instead of losing the driver."""
+    answers = [HttpResponse(429, b"Please limit requests"), HttpResponse(200, b'{"articles": []}')]
+    calls = []
+
+    def live(request, timeout):
+        calls.append(request.url)
+        return answers.pop(0)
+
+    monkeypatch.setattr(news, "http_get", live)  # treat the fake as the real transport
+    monkeypatch.setattr(news, "GDELT_GAP_SECONDS", 0.0)
+    (signal,) = news.fetch(driver("commodity_news", {"commodity": "PET resin"}), ctx(live))
+    assert signal.ok and len(calls) == 2
+
+
+def test_gdelt_pauses_after_repeated_429(monkeypatch):
+    calls = []
+
+    def limited(request, timeout):
+        calls.append(request.url)
+        return HttpResponse(429, b"Please limit requests")
+
+    monkeypatch.setattr(news, "http_get", limited)
+    monkeypatch.setattr(news, "GDELT_GAP_SECONDS", 0.0)
+    monkeypatch.setattr(news, "_gdelt_paused_until", 0.0)
+    item = driver("commodity_news", {"commodity": "PET resin"})
+    for _ in range(2):  # the collector turns this error into a visible gap on the driver
+        with pytest.raises(ProviderError, match="limiting requests"):
+            news.fetch(item, ctx(limited))
+    assert len(calls) == 3  # three tries on the first driver, none on the second

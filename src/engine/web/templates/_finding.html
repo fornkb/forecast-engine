@@ -1,0 +1,48 @@
+{% set state = decision(finding.flags) %}
+{% set checks = check_flags(finding.flags) %}
+{% set made = decisions.get(finding.finding_id) %}
+<article class="finding {{ finding.channel }} {{ state }}{{ ' new' if finding.new_factor }}" id="{{ finding.finding_id }}">
+  <div class="finding-head">
+    <span class="finding-id">{{ finding.finding_id }} · {{ finding.new_factor or finding.driver_id|title_id }}</span>
+    {% if finding.new_factor %}<span class="pill new" title="Found in the open news scan. No watched driver covers it, so its size is capped more tightly.">New factor</span>{% endif %}
+    <span class="pill {{ 'good' if finding.channel == 'demand' else 'warn' }}">{{ CHANNEL_LABEL[finding.channel] }}</span>
+    <span class="pill plain">{{ TIER_LABEL[finding.tier] }}</span>
+    <span class="pill plain">Confidence {{ finding.confidence }}</span>
+    {% if finding.carried_from %}<span class="pill plain">Unchanged since {{ finding.carried_from }}</span>{% endif %}
+    {% if finding.already_in_forecast %}<span class="pill plain">Already in forecast</span>{% endif %}
+    {% if state %}<span class="pill info">{{ icon('check') }} {{ decision_label(finding.flags) }}</span>{% endif %}
+  </div>
+  <div class="effect">
+    {% if finding.low_pct == 0 and finding.high_pct == 0 %}No quantity change{% else %}{{ finding.low_pct|pct }} to {{ finding.high_pct|pct }}{% endif %}
+    <span class="muted">· {% for mo in finding.months %}{{ mo|month }}{{ ', ' if not loop.last }}{% endfor %}</span>
+  </div>
+  <p>{{ finding.reasoning }}</p>
+  {% if finding.quote %}<blockquote>“{{ finding.quote }}”</blockquote>{% endif %}
+  {% if finding.citations %}
+  <ul class="cites">
+    {% for key in finding.citations if key in refs %}{% set ref = refs[key] %}
+      <li><b>{{ key }}</b>
+        {% if ref.url.startswith('http://') or ref.url.startswith('https://') %}<a href="{{ ref.url }}" rel="noopener noreferrer" target="_blank">{{ ref.title[:120] }}</a>{% else %}{{ ref.title[:120] }}{% endif %}
+        {% if ref.source %}<span class="muted">· {{ ref.source }}</span>{% endif %}{% if ref.published %}<span class="muted"> · {{ ref.published }}</span>{% endif %}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% if made and made.note %}<div class="checks-line">{{ icon('edit') }} Planner note ({{ made.actor }}, {{ made.at|when }}): {{ made.note }}</div>{% endif %}
+  {% if checks %}<div class="checks-line">Python checks: {{ checks|map('flag')|join(', ') }}</div>{% endif %}
+  <div class="decide">
+    {% set target = '/c/' ~ client_id ~ '/runs/' ~ run.reason_id ~ '/findings/' ~ finding.finding_id %}
+    <form method="post" action="{{ target }}"><button name="action" value="accept" class="sm">{{ icon('check') }} Accept</button></form>
+    <form method="post" action="{{ target }}"><button name="action" value="dismiss" class="sm secondary">Dismiss</button></form>
+    {% if finding.new_factor and state != 'dismissed' %}<form method="post" action="{{ target }}/watch"><button class="sm secondary" title="Accept, and track “{{ finding.watch_query or finding.new_factor }}” in every later review">{{ icon('plus') }} Add to watch list</button></form>{% endif %}
+    <details class="edit">
+      <summary class="btn sm secondary">{{ icon('edit') }} Edit range</summary>
+      <form method="post" action="{{ target }}" class="inline-form">
+        <input type="hidden" name="action" value="edit">
+        <label class="field">Low % <input name="low" type="number" step="0.1" value="{{ finding.low_pct }}" required></label>
+        <label class="field">High % <input name="high" type="number" step="0.1" value="{{ finding.high_pct }}" required></label>
+        <label class="field grow">Note <input name="note" maxlength="500" placeholder="Why, for the audit trail"></label>
+        <button class="sm">Save</button>
+      </form>
+    </details>
+  </div>
+</article>

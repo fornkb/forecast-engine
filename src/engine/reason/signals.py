@@ -75,10 +75,14 @@ def measured_from_params(driver: ResolvedDriver, ctx: Context) -> list[Signal]:
     periods = driver.params.get("analog_periods")
     if not periods:
         return []
-    months = [
-        date.fromisoformat(f"{value}-01")
-        for value in ([periods] if isinstance(periods, str) else periods)
-    ]
+    months = []
+    for value in [periods] if isinstance(periods, str) else periods:
+        try:  # written by people and by the onboarding model: skip anything not YYYY-MM
+            months.append(date.fromisoformat(f"{str(value).strip()[:7]}-01"))
+        except ValueError:
+            continue
+    if not months:
+        return []
     label = driver.params.get("analog_label", "the analog months")
     signals = []
     for family_id in driver.families:
@@ -153,7 +157,7 @@ def collect(
         else:
             for name in driver.template.connectors:
                 if scenario is not None and name in NETWORK:
-                    signals += scenario.signals(driver.id, name)
+                    signals += scenario.signals(driver.id, "news" if name == "scan" else name)
                     stats["scenario"] += 1
                     continue
                 try:

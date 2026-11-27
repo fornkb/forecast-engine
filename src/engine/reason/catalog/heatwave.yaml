@@ -1,9 +1,10 @@
 id: heatwave
 kind: weather
-description: Heatwave risk for a region from seasonal temperature anomalies and heatwave news.
+listed: false
+description: Temperature outlook for a region plus heat-related news. Kept for existing profiles; new profiles use seasonal_weather plus a news search.
 connectors: [weather, news]
 news_query: 'heatwave {region_name}'
 required_params: [region]
 mechanism_hint: >-
-  Heatwaves raise demand for water, beverages, cooling and electricity, and can cut
-  labour productivity and water availability for production.
+  Unusual heat can change what people buy and how much, and can affect production and
+  logistics.

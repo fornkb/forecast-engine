@@ -1,0 +1,48 @@
+{% macro initials(name) -%}
+{%- set words = name.replace('—', ' ').replace('(', ' ').split() -%}
+{{ (words[0][0] ~ (words[1][0] if words|length > 1 else ''))|upper }}
+{%- endmacro %}
+
+{% macro delta(value, suffix='vs last year') -%}
+{% if value is none %}<span class="muted small">no comparison</span>
+{%- else %}<span class="delta {{ 'up' if value >= 0 else 'down' }}">{{ '▲' if value >= 0 else '▼' }} {{ '%+.1f'|format(value) }}%</span> <span class="muted small">{{ suffix }}</span>{% endif %}
+{%- endmacro %}
+
+{% macro level_pill(level) -%}
+{% if level == 'bad' %}<span class="pill bad">Action needed</span>
+{% elif level == 'warn' %}<span class="pill warn">Needs attention</span>
+{% elif level == 'info' %}<span class="pill info">Decisions open</span>
+{% elif level == 'off' %}<span class="pill">Reasoning off</span>
+{% else %}<span class="pill good">Up to date</span>{% endif %}
+{%- endmacro %}
+
+{% macro client_header(head, tab, subtitle='', open_count=0) -%}
+<div class="page-head">
+  <div class="client-head">
+    <div class="avatar" aria-hidden="true">{{ initials(head.name) }}</div>
+    <div>
+      <h1>{{ head.name }}</h1>
+      {% if subtitle %}<p class="lead">{{ subtitle }}</p>{% endif %}
+      <div class="meta">
+        {% if head.error %}<span class="pill bad">Config error</span>
+        {% elif not head.enabled %}<span class="pill">Reasoning off</span>
+        {% elif head.ready %}<span class="pill good">{{ icon('check') }} Ready</span>
+        {% else %}<span class="pill warn">Setup needed</span>{% endif %}
+        <span class="pill plain">{{ head.granularity|title }} forecasts</span>
+        {% if head.enabled %}<span class="pill plain">{{ head.provider }} · {{ head.model }}</span>{% endif %}
+        {% if head.profile_status in ('draft', 'confirmed') %}<span class="pill plain">Profile {{ head.profile_status }}</span>{% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="actions">{{ caller() if caller else '' }}</div>
+</div>
+<nav class="tabs" aria-label="Client sections">
+  <a href="/c/{{ head.client_id }}" {% if tab == 'summary' %}aria-current="page"{% endif %}>{{ icon('summary') }} Summary</a>
+  <a href="/c/{{ head.client_id }}/forecast" {% if tab == 'forecast' %}aria-current="page"{% endif %}>{{ icon('forecast') }} Forecast</a>
+  {% if head.enabled %}
+  <a href="/c/{{ head.client_id }}/reviews" {% if tab == 'reviews' %}aria-current="page"{% endif %}>{{ icon('reviews') }} External factors{% if open_count %} <span class="badge">{{ open_count }}</span>{% endif %}</a>
+  <a href="/c/{{ head.client_id }}/profile" {% if tab == 'profile' %}aria-current="page"{% endif %}>{{ icon('profile') }} Company profile</a>
+  {% endif %}
+  <a href="/c/{{ head.client_id }}/settings" {% if tab == 'settings' %}aria-current="page"{% endif %}>{{ icon('settings') }} Settings</a>
+</nav>
+{%- endmacro %}

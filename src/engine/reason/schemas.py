@@ -86,6 +86,9 @@ class CompanyProfile(StrictModel):
     families: list[Family]
     drivers: list[Driver] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
+    # Broad news searches run every review to catch developments no driver covers.
+    # Empty = built from the family names and the main country.
+    scan: list[str] = Field(default_factory=list)
     notes: str = ""
 
     def family(self, family_id: str) -> Family | None:
@@ -99,9 +102,13 @@ class DriverTemplate(StrictModel):
     """A reusable kind of external factor, shipped in reason/catalog/*.yaml."""
 
     id: str
-    kind: Literal["climate", "weather", "commodity", "calendar", "policy", "geopolitics", "market"]
+    kind: Literal[
+        "climate", "weather", "commodity", "calendar", "policy", "geopolitics", "market", "news"
+    ]
     description: str
-    connectors: list[Literal["news", "weather", "enso", "calendar"]]
+    connectors: list[Literal["news", "weather", "enso", "calendar", "scan"]]
+    # Unlisted templates still work in existing profiles but are not offered to onboarding.
+    listed: bool = True
     news_query: str = ""  # may use {param} placeholders filled from Driver.params
     mechanism_hint: str = ""
     required_params: list[str] = Field(default_factory=list)
@@ -179,9 +186,29 @@ class QuietOut(StrictModel):
     reason: str
 
 
+class NewFactorOut(StrictModel):
+    """A development found in the open news scan that no watched driver covers."""
+
+    name: str
+    family_id: str
+    channel: Channel
+    direction: Literal["up", "down", "mixed", "none"]
+    months: list[str]
+    low_pct: float
+    high_pct: float
+    evidence_tier: Tier
+    quote: str
+    citations: list[str]
+    already_in_forecast: bool
+    confidence: Literal["low", "medium", "high"]
+    reasoning: str
+    watch_query: str
+
+
 class ReasoningOut(StrictModel):
     summary: str
     findings: list[FindingOut]
+    new_factors: list[NewFactorOut]
     no_change: list[QuietOut]
 
 
@@ -222,6 +249,7 @@ class ProfileDraftOut(StrictModel):
     regions: list[RegionOut]
     families: list[FamilyOut]
     drivers: list[DriverOut]
+    scan_topics: list[str]
     questions: list[str]
 
 
@@ -245,6 +273,9 @@ class Finding(StrictModel):
     already_in_forecast: bool = False
     flags: list[str] = Field(default_factory=list)
     carried_from: str | None = None  # reason_id of the run that produced it
+    # Set when the finding came from the open news scan rather than a watched driver.
+    new_factor: str = ""
+    watch_query: str = ""
 
 
 class Band(StrictModel):

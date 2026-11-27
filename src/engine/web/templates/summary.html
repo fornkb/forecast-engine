@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}{{ head.name }} · {{ PRODUCT }}{% endblock %}
+{% block content %}
+{% set f = v.forecast %}
+{% set d = v.digest %}
+{% call m.client_header(head, 'summary', v.summary, d.open if d else 0) %}
+  {% if can_pipeline and f %}
+  <form method="post" action="/c/{{ head.client_id }}/forecast/refresh" data-busy>
+    <input type="hidden" name="horizon" value="{{ f.months|length }}">
+    <button class="secondary">{{ icon('refresh') }} Refresh forecast</button>
+  </form>
+  {% endif %}
+  {% if head.enabled %}<a class="btn" href="/c/{{ head.client_id }}/reviews#new">{{ icon('play') }} Run review</a>{% endif %}
+{% endcall %}
+
+{% if job %}<div class="note">{{ icon('clock') }}<span>{{ job.label }} started {{ job.seconds }} s ago. <a href="/c/{{ head.client_id }}/jobs/{{ job.id }}">Watch progress</a></span></div>{% endif %}
+
+{% if not f %}
+<section class="card empty">
+  <h3>No saved forecast yet</h3>
+  <p>Load this client's sales history and run the forecast, then come back here.</p>
+  <p><code>engine ingest --client {{ head.client_id }} --file …</code> → <code>engine forecast --client {{ head.client_id }}</code></p>
+</section>
+{% else %}
+<div class="kpis">
+  <div class="kpi">
+    <div class="label">{{ icon('forecast') }} Next {{ f.months|length }} months</div>
+    <div class="value">{{ f.horizon_total|compact }} <small>units</small></div>
+    <div class="foot-note">{{ m.delta(f.change_pct) }}</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('target') }} Forecast accuracy</div>
+    {% if v.accuracy %}
+    <div class="value">{{ v.accuracy.accuracy_pct }}%</div>
+    <div class="foot-note">{% if v.accuracy.gain_pct is not none %}<span class="delta {{ 'up' if v.accuracy.gain_pct >= 0 else 'down' }}">{{ '%.0f'|format(v.accuracy.gain_pct|abs) }}% {{ 'less' if v.accuracy.gain_pct >= 0 else 'more' }} error</span> than a simple baseline{% endif %}</div>
+    {% else %}
+    <div class="value">–</div>
+    <div class="foot-note">Not measured yet: run a backtest</div>
+    {% endif %}
+  </div>
+  <div class="kpi accent">
+    <div class="label">{{ icon('reviews') }} External factors</div>
+    {% if d and v.reviewed_current and d.moves %}
+    <div class="value range-val">{{ '%+.1f'|format(d.low_pct) }}% <small>to</small> {{ '%+.1f'|format(d.high_pct) }}%</div>
+    <div class="foot-note">What-if range on the total</div>
+    {% elif d and v.reviewed_current %}
+    <div class="value">No change</div>
+    <div class="foot-note">{{ d.alerts }} cost or supply alert{{ '' if d.alerts == 1 else 's' }}</div>
+    {% else %}
+    <div class="value">–</div>
+    <div class="foot-note">{% if head.enabled %}This forecast is not reviewed yet{% else %}Reviews are off{% endif %}</div>
+    {% endif %}
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('flag') }} Open decisions</div>
+    <div class="value">{{ d.open if d else '–' }}{% if d %} <small>of {{ d.open + d.decided }}</small>{% endif %}</div>
+    <div class="foot-note">{% if d and d.open %}<a href="/c/{{ head.client_id }}/runs/{{ d.run.reason_id }}">Decide now →</a>{% elif d %}All findings decided{% else %}No review yet{% endif %}</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('check') }} Sources checked</div>
+    {% if d %}<div class="value">{{ d.outcome.checked }}</div>
+    <div class="foot-note">{% if d.outcome.complete %}All worked in the last review{% else %}<span class="down">{{ d.outcome.missing }} could not be checked</span>{% endif %}</div>
+    {% else %}<div class="value">–</div><div class="foot-note">No review yet</div>{% endif %}
+  </div>
+</div>
+
+<div class="grid-2" style="margin-bottom:20px">
+  <section class="card">
+    <div class="card-head">
+      <div><h2>Demand outlook</h2><div class="sub">All SKUs, units per month · history to {{ f.cutoff|month }}</div></div>
+      <div class="legend" aria-hidden="true"><span><i class="key"></i>Actual</span><span><i class="key forecast"></i>Forecast</span><span><i class="key {{ chart.band }}"></i>{{ BAND_LABEL[chart.band] }}</span></div>
+    </div>
+    <figure class="chart" data-chart="{{ chart.data }}">{{ chart.svg }}<div class="tip" hidden></div></figure>
+    {% if f.stale %}<div class="note warn" style="margin:14px 0 0">{{ icon('alert') }}<span>Sales data now runs to {{ f.data_until|month }}, newer than this forecast. Refresh the forecast, then review it.</span></div>{% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>Latest review</h2>{% if d %}<div class="sub">{{ d.run.as_of|day }} · {{ d.run.status }}{% if not v.reviewed_current %} · older forecast{% endif %}</div>{% endif %}</div>
+      {% if d %}<a class="more" href="/c/{{ head.client_id }}/runs/{{ d.run.reason_id }}">Open {{ icon('arrow') }}</a>{% endif %}</div>
+    {% if d %}
+    <div class="headline-card">
+      <div class="icon-box">{{ icon('reviews') }}</div>
+      <div><div class="text">{{ d.headline }}.</div>
+        {% if d.run.summary %}<p class="summary-text small">{{ d.run.summary }}</p>{% endif %}</div>
+    </div>
+    <ul class="alerts" style="margin-top:10px">
+      {% for finding in d.run.findings[:5] %}
+      <li>
+        <span class="dot {{ 'warn' if finding.channel != 'demand' else ('off' if 'dismissed' in finding.flags else 'ok') }}" aria-hidden="true"></span>
+        <span class="what"><b>{{ finding.driver_id|title_id }}</b> · {{ d.family_names.get(finding.family_id, finding.family_id) }}</span>
+        <span class="range small">{% if finding.low_pct == 0 and finding.high_pct == 0 %}{{ CHANNEL_LABEL[finding.channel] }} alert{% else %}{{ finding.low_pct|pct }} to {{ finding.high_pct|pct }}{% endif %}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% if d.run.scenario %}<p class="small muted" style="margin-top:8px">{{ icon('info') }} Scenario data, for a demonstration.</p>{% endif %}
+    {% elif head.enabled %}
+    <div class="empty"><h3>No review yet</h3><p>Check this forecast against weather, commodity prices, festivals and news.</p>
+      <a class="btn" href="/c/{{ head.client_id }}/reviews#new">{{ icon('play') }} Run first review</a></div>
+    {% else %}
+    <div class="empty"><h3>Reviews are off</h3><p>Turn on the reasoning layer in Settings to check this forecast against external factors.</p></div>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card flush">
+  <div class="card-head"><div><h2>By {{ f.group_label }}</h2><div class="sub">Next {{ f.months|length }} months{% if v.reviewed_current %}, with the what-if range from the latest review{% endif %}</div></div>
+    <a class="more" href="/c/{{ head.client_id }}/forecast">Forecast details {{ icon('arrow') }}</a></div>
+  <div class="table-wrap" style="margin-top:12px">
+  <table class="table">
+    <thead><tr><th>{{ f.group_label|capitalize }}</th><th>Trend</th><th class="r">Forecast</th><th class="r">vs last year</th>{% if v.reviewed_current %}<th class="r">What-if range</th><th>Drivers</th>{% endif %}</tr></thead>
+    <tbody>
+    {% for g in f.groups %}
+      {% set i = impact.get(g.id) if v.reviewed_current else none %}
+      <tr>
+        <td><span class="cell-title">{{ g.name }}</span><span class="cell-sub">{{ g.series }} SKU{{ '' if g.series == 1 else 's' }}</span></td>
+        <td>{{ sparkline(g.history, g.months|map(attribute='forecast')|list) }}</td>
+        <td class="r strong">{{ g.total|num }}</td>
+        <td class="r">{% if g.change_pct is not none %}<span class="delta {{ 'up' if g.change_pct >= 0 else 'down' }}">{{ '%+.1f'|format(g.change_pct) }}%</span>{% else %}–{% endif %}</td>
+        {% if v.reviewed_current %}
+        <td class="r">{% if i and (i.low_pct or i.high_pct) %}<span class="range">{{ '%+.1f'|format(i.low_pct) }}% to {{ '%+.1f'|format(i.high_pct) }}%</span>{% else %}<span class="muted">no change</span>{% endif %}</td>
+        <td class="small">{% if i and i.drivers %}{{ i.drivers|map('title_id')|join(', ') }}{% else %}<span class="muted">–</span>{% endif %}</td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+
+<div class="grid-even">
+  <section class="card">
+    <div class="card-head"><h2>Needs attention</h2></div>
+    {% if v.attention %}
+    <ul class="alerts">
+      {% for item in v.attention %}
+      <li><span class="dot {{ item.level }}" aria-hidden="true"></span><span class="what">{{ item.text }}</span>{% if item.link %}<a class="go" href="{{ item.link }}">Open →</a>{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% else %}<p class="muted">Nothing. Forecast and review are up to date.</p>{% endif %}
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>About this client</h2><a class="more" href="/c/{{ head.client_id }}/settings">Settings {{ icon('arrow') }}</a></div>
+    <dl class="facts">
+      <dt>Client id</dt><dd><code>{{ head.client_id }}</code></dd>
+      {% if f %}<dt>Forecast</dt><dd>Run {{ f.run_id }} · {{ f.series }} series · {{ f.months[0]|month }} – {{ f.months[-1]|month }}</dd>
+      <dt>Models</dt><dd>{% for name, count in f.models.items() %}{{ name }} ({{ count }}){{ ', ' if not loop.last }}{% endfor %}</dd>{% endif %}
+      {% if head.enabled %}<dt>Company profile</dt><dd>{{ head.profile_status }} · {{ head.families }} families · {{ head.drivers }} drivers</dd>
+      <dt>AI model</dt><dd>{{ head.provider }} · {{ head.model }}</dd>{% endif %}
+    </dl>
+  </section>
+</div>
+{% endblock %}

@@ -246,3 +246,16 @@ def overrides(store: EngineStore, reason_id: str) -> list[Override]:
         )
         latest[item.finding_id] = item
     return list(latest.values())
+
+
+def profile_versions(store: EngineStore, limit: int = 20) -> list[dict]:
+    """Saved company-profile versions, newest first (who saved it and when)."""
+    if not store.path.exists():
+        return []
+    with reader(store) as con:
+        rows = con.execute(
+            "SELECT profile_hash, saved_at, actor FROM reason_profile_versions"
+            " WHERE client_id = ? ORDER BY saved_at DESC LIMIT ?",
+            [store.client_id, limit],
+        ).fetchall()
+    return [{"profile_hash": r[0], "saved_at": r[1], "actor": r[2]} for r in rows]

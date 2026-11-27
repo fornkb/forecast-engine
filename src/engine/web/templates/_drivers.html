@@ -1,0 +1,15 @@
+<table class="table">
+  <thead><tr><th>Driver</th><th>Status</th><th>What was found</th></tr></thead>
+  <tbody>
+  {% for d in run.drivers %}
+    <tr><td class="strong nowrap">{{ d.driver_id|title_id }}</td>
+      <td><span class="pill {% if d.status == 'changed' %}good{% elif d.status == 'no_data' %}warn{% elif d.status == 'error' %}bad{% else %}plain{% endif %}">{{ d.status.replace('_', ' ')|capitalize }}</span></td>
+      <td class="small">
+        {% for sig in d.signals %}
+          <div style="margin:2px 0">{% if sig.ok %}<span class="muted">{{ sig.kind|capitalize }}:</span> {{ sig.summary }}{% else %}<span class="down">{{ sig.kind|capitalize }}: {{ sig.error }}</span>{% endif %}
+          {% if sig.articles %}<span class="muted">· {{ sig.articles|length }} article{{ '' if sig.articles|length == 1 else 's' }}</span>{% endif %}</div>
+        {% else %}<span class="muted">–</span>{% endfor %}
+      </td></tr>
+  {% endfor %}
+  </tbody>
+</table>

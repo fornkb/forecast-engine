@@ -10,6 +10,7 @@ from collections import Counter
 from html import escape
 
 from engine.reason.adjust import active
+from engine.reason.outcome import outcome
 from engine.reason.schemas import FamilySummary, Finding, ReasonRun
 
 TIER_LABEL = {
@@ -78,6 +79,13 @@ def _sparkline(family: FamilySummary, width: int = 420, height: int = 120) -> st
     )
 
 
+def finding_title(finding: Finding) -> str:
+    """The cause a finding is about: a watched driver, or a new factor from the open scan."""
+    if finding.new_factor:
+        return f"New factor: {finding.new_factor}"
+    return finding.driver_id.replace("_", " ").title()
+
+
 def _finding_card(finding: Finding, refs: dict) -> str:
     links = []
     for key in finding.citations:
@@ -104,7 +112,7 @@ def _finding_card(finding: Finding, refs: dict) -> str:
     )
     return f"""
     <div class="finding {finding.channel} {state}">
-      <div class="row"><b>{escape(finding.finding_id)} · {escape(finding.driver_id)}</b>
+      <div class="row"><b>{escape(finding.finding_id)} · {escape(finding_title(finding))}</b>
         <span class="tag {finding.channel}">{CHANNEL_LABEL[finding.channel]}</span>
         <span class="tag">{TIER_LABEL[finding.tier]}</span>
         <span class="tag">confidence {finding.confidence}</span>{carried}</div>
@@ -161,7 +169,7 @@ def render_html(run: ReasonRun) -> str:
     for finding in run.findings:
         findings_by_family.setdefault(finding.family_id, []).append(finding)
     counts = Counter(f.channel for f in run.findings if "dismissed" not in f.flags)
-    changed = [d.driver_id for d in run.drivers if d.status == "changed"]
+    result = outcome(run)
     cost_text = (
         "unknown (set reasoning.llm.rates)"
         if used["cost"] is None
@@ -196,6 +204,9 @@ def render_html(run: ReasonRun) -> str:
             "run; earlier findings carried forward at no cost.</li>"
         )
     gaps = "".join(f"<li>{escape(g)}</li>" for g in [*run.not_assessed, *run.gaps])
+    failed = "".join(
+        f"<li><b>{escape(c.label)}</b>: {escape(c.detail)}</li>" for c in result.failed
+    ) + "".join(f"<li>{escape(item)}</li>" for item in run.not_assessed)
     banner = (
         f'<div class="banner"><b>Scenario data.</b> {escape(run.scenario)}. Signals in this '
         "report are illustrative, prepared for a demonstration, not live news.</div>"
@@ -206,18 +217,19 @@ def render_html(run: ReasonRun) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Forecast reasoning · {escape(run.client_id)} · {run.as_of:%b %Y}</title><style>{CSS}</style></head>
 <body><main>
-  <h1>External factors and the forecast</h1>
+  <h1>What changed that could affect the forecast</h1>
   <div class="sub">{escape(run.client_id)} · forecast run {run.forecast_run_id} · reviewed {run.as_of:%d %b %Y}
    · months {run.months[0]:%b %Y} – {run.months[-1]:%b %Y}</div>
   {banner}
+  <div class="summary"><b>{escape(result.headline)}.</b>
+   {escape(run.summary) if run.summary else ""}</div>
+  {f'<div class="banner"><b>Could not be checked</b><ul>{failed}</ul></div>' if failed else ""}
   <div class="cards">
-    <div class="card"><b>{len(run.drivers)}</b>drivers checked</div>
-    <div class="card"><b>{len(changed)}</b>with new information</div>
+    <div class="card"><b>{result.checked}</b>sources checked</div>
     <div class="card"><b>{counts.get("demand", 0)}</b>demand findings</div>
+    <div class="card"><b>{result.new_factors}</b>new factors</div>
     <div class="card"><b>{counts.get("supply_risk", 0) + counts.get("cost", 0)}</b>supply / cost alerts</div>
-    <div class="card"><b>{used["calls"]}</b>AI calls · {used["input_tokens"] + used["output_tokens"]:,} tokens</div>
   </div>
-  {f'<div class="summary">{escape(run.summary)}</div>' if run.summary else ""}
   <h2>By product family</h2>
   <p class="sub">The what-if band shows the forecast under the stated conditions. It is not a
   probability range; the model range (p10–p90) is the forecasting model's own uncertainty.</p>
@@ -233,13 +245,17 @@ def render_html(run: ReasonRun) -> str:
 
 def render_markdown(run: ReasonRun) -> str:
     used = totals(run)
+    result = outcome(run)
     lines = [
         f"# External factors · {run.client_id} · {run.as_of:%d %b %Y}",
         "",
         f"Forecast run {run.forecast_run_id} · run `{run.reason_id}` · {used['calls']} AI calls · "
-        f"{used['input_tokens'] + used['output_tokens']:,} tokens · cost "
-        f"{'unknown' if used['cost'] is None else used['cost']}",
+        f"cost {'unknown' if used['cost'] is None else used['cost']}",
+        "",
+        f"**{result.headline}.**",
     ]
+    if result.failed:
+        lines += ["", "Could not be checked:"] + [f"- {c.label}: {c.detail}" for c in result.failed]
     if run.scenario:
         lines += ["", f"> Scenario data: {run.scenario}. Illustrative, not live news."]
     if run.summary:
@@ -260,7 +276,7 @@ def render_markdown(run: ReasonRun) -> str:
         for finding in [f for f in run.findings if f.family_id == family.family_id]:
             lines += [
                 "",
-                f"- **{finding.finding_id} {finding.driver_id}** · "
+                f"- **{finding.finding_id} {finding_title(finding)}** · "
                 f"{CHANNEL_LABEL[finding.channel]} · {_pct(finding.low_pct, finding.high_pct)}"
                 f" · {TIER_LABEL[finding.tier]} · {finding.reasoning} "
                 f"(cites {', '.join(finding.citations) or 'none'})",

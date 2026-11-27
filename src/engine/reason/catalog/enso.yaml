@@ -1,9 +1,9 @@
 id: enso
 kind: climate
-description: El Niño / La Niña status from NOAA CPC, plus regional news about its expected local effects.
+description: Current El Niño / La Niña (ENSO) status from NOAA CPC, plus news about its expected effects in the country.
 connectors: [enso, news]
 news_query: '("El Nino" OR "La Nina") {country_name}'
 mechanism_hint: >-
-  ENSO shifts seasonal rainfall and temperature in many regions (in India, El Niño
-  years tend to bring weaker monsoons and hotter pre-monsoon months). Local impact
-  needs regional evidence; a NOAA probability alone is not a local forecast.
+  ENSO is a global climate pattern that shifts seasonal rainfall and temperature, with
+  effects that differ by region. A NOAA status alone is not a local forecast; local
+  effects need regional evidence.

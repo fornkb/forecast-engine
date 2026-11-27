@@ -1,9 +1,9 @@
 id: market_news
 kind: market
-description: Demand-side news for the company's markets (construction activity, competitor moves, sector growth).
+description: News search on the company's markets or customers' industries in its country.
 connectors: [news]
 news_query: '{topic} {country_name}'
 required_params: [topic]
 mechanism_hint: >-
-  Changes in the customer's own industry (housing starts, plant openings, a competitor
-  exiting) move demand directly, often with a lag of one or more months.
+  Changes in customers' own industries, competitors or channels move demand directly,
+  often with a lag.

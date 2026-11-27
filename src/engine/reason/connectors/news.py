@@ -10,17 +10,30 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from contextlib import suppress
 from datetime import UTC, datetime
 from html import unescape
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from engine.reason.connectors.http import HttpRequest, ProviderError, get_ok
+from engine.reason.connectors.http import HttpRequest, HttpResponse, ProviderError, get_ok, http_get
 from engine.reason.schemas import Article, Signal
 
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 BRAVE_URL = "https://api.search.brave.com/res/v1/news/search"
 _TRACKING = {"fbclid", "gclid", "mc_cid", "mc_eid", "msclkid"}
+# GDELT allows about one request every 5 seconds per client and answers bursts with HTTP 429.
+GDELT_GAP_SECONDS = 6.0
+# After GDELT keeps refusing, stop asking for a while instead of retrying every driver.
+GDELT_PAUSE_SECONDS = 600.0
+GDELT_LIMITED = (
+    "GDELT news is limiting requests from this network. Wait about 10 minutes and try again, "
+    "or use the Brave news provider (sources.news.provider: brave)."
+)
+_gdelt_lock = threading.Lock()
+_gdelt_last = 0.0
+_gdelt_paused_until = 0.0
 
 
 def canonical_url(value: object) -> str:
@@ -61,6 +74,31 @@ def dedupe(articles: list[Article]) -> list[Article]:
     return kept
 
 
+def _gdelt_get(ctx, request: HttpRequest, timeout: float) -> HttpResponse:
+    """GDELT politely: space real requests out, retry twice after a 429, then pause."""
+    global _gdelt_last, _gdelt_paused_until
+    if ctx.http is not http_get:  # injected transports (tests, replays) need no pacing
+        return get_ok(ctx.http, request, timeout)
+    if time.monotonic() < _gdelt_paused_until:
+        raise ProviderError(GDELT_LIMITED)
+    response = None
+    for attempt in range(3):
+        with _gdelt_lock:
+            wait = _gdelt_last + GDELT_GAP_SECONDS * (attempt + 1) - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            response = ctx.http(request, timeout)
+            _gdelt_last = time.monotonic()
+        if response.status != 429:
+            break
+    if response.status == 429:
+        _gdelt_paused_until = time.monotonic() + GDELT_PAUSE_SECONDS
+        raise ProviderError(GDELT_LIMITED)
+    if response.status != 200:
+        raise ProviderError(f"HTTP {response.status} from {request.url}")
+    return response
+
+
 def _gdelt(query: str, source, ctx) -> list[Article]:
     terms = [query]
     if source.language:
@@ -78,7 +116,7 @@ def _gdelt(query: str, source, ctx) -> list[Article]:
             "sort": "hybridrel",
         },
     )
-    body = get_ok(ctx.http, request, source.timeout_seconds).text().strip()
+    body = _gdelt_get(ctx, request, source.timeout_seconds).text().strip()
     if not body:
         return []
     if not body.startswith("{"):
@@ -172,3 +210,42 @@ def fetch(driver, ctx) -> list[Signal]:
             source_ref=source.provider,
         )
     ]
+
+
+def scan(driver, ctx) -> list[Signal]:
+    """The open scan: one news search per topic, so one failed search does not hide the rest."""
+    source = ctx.sources.news
+    if source.provider == "none":
+        return []
+    search = _gdelt if source.provider == "gdelt" else _brave
+    signals, seen = [], set()
+    for query in driver.params.get("queries", []):
+        try:
+            found = dedupe(search(query, source, ctx))
+        except (ProviderError, ValueError) as exc:
+            signals.append(
+                Signal(
+                    driver_id=driver.id,
+                    kind="news",
+                    summary=f"open search '{query}' failed",
+                    data={"query": query, "provider": source.provider},
+                    ok=False,
+                    error=str(exc)[:200],
+                    source_ref=source.provider,
+                )
+            )
+            continue
+        articles = [a for a in found if title_key(a.title) not in seen]
+        articles = articles[: source.max_articles_per_driver]
+        seen.update(title_key(a.title) for a in articles)
+        signals.append(
+            Signal(
+                driver_id=driver.id,
+                kind="news",
+                summary=f"{len(articles)} recent articles for open search '{query}'",
+                data={"query": query, "provider": source.provider},
+                articles=articles,
+                source_ref=source.provider,
+            )
+        )
+    return signals

@@ -14,6 +14,8 @@ from engine.reason.connectors.http import ProviderError
 from engine.reason.forecast import analog_uplift
 from engine.reason.schemas import Signal
 
+MIN_FESTIVAL_MONTHS = 3
+
 
 def festival_dates(name: str, country: str, years: range, explicit: list[str]) -> list[date]:
     if explicit:
@@ -78,6 +80,8 @@ def fetch(driver, ctx) -> list[Signal]:
         if measured is None:
             continue
         uplift, used = measured
+        if used < MIN_FESTIVAL_MONTHS:
+            continue  # two festival months of history measure noise, not the festival
         signals.append(
             Signal(
                 driver_id=driver.id,

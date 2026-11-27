@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+{% set e = run.estimate %}
+<div class="page-head">
+  <div>
+    <h1>Cost estimate</h1>
+    <p class="lead">Signals were collected. No AI call was made and nothing was saved. Review date {{ run.as_of|day }}.</p>
+  </div>
+  <div class="actions"><a class="btn secondary" href="/c/{{ client_id }}/reviews#new">Back to the review form</a></div>
+</div>
+{% if run.scenario %}<div class="note warn">{{ icon('info') }}<span><b>Scenario data.</b> {{ run.scenario }}</span></div>{% endif %}
+<div class="kpis">
+  <div class="kpi"><div class="label">{{ icon('usage') }} AI calls</div><div class="value">{{ e.calls or 0 }}</div><div class="foot-note">for this review</div></div>
+  <div class="kpi"><div class="label">{{ icon('estimate') }} Input tokens</div><div class="value">{{ '{:,}'.format(e.input_tokens or 0) }}</div><div class="foot-note">about {{ e.output_tokens_guess or 0 }} out</div></div>
+  <div class="kpi accent"><div class="label">{{ icon('cost') }} Cost guess</div><div class="value">{% if e.cost_guess is not none %}{{ e.cost_guess|money }}{% else %}?{% endif %}</div><div class="foot-note">{% if e.cost_guess is none %}No rate set for this model{% else %}at the configured rates{% endif %}</div></div>
+  <div class="kpi"><div class="label">{{ icon('reviews') }} Drivers to assess</div><div class="value">{{ (e.drivers_to_assess or [])|length }}</div><div class="foot-note">{% if e.unchanged %}{{ e.unchanged|length }} unchanged, free{% else %}all drivers{% endif %}</div></div>
+</div>
+<section class="card flush">
+  <div class="card-head"><h2>What each driver found</h2></div>
+  <div class="table-wrap" style="margin-top:12px">{% include "_drivers.html" %}</div>
+</section>
+{% endblock %}

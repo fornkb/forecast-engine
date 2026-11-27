@@ -1,0 +1,8 @@
+id: topic_news
+kind: news
+description: News search on any topic, in any words (use when no other source fits).
+connectors: [news]
+news_query: '{topic}'
+required_params: [topic]
+mechanism_hint: >-
+  Recent news on a development that could change this company's demand, supply or costs.

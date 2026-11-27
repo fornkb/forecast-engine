@@ -301,8 +301,50 @@ class FakeModel:
                 else []
             )
             del rules
+            new_factors = []
+            if "OTHER NEWS" in prompt:
+                port = next((k for k, v in refs.items() if "Port workers" in v), "A9")
+                new_factors = [
+                    {
+                        "name": "Port strike",
+                        "family_id": "jars",
+                        "channel": "demand",
+                        "direction": "down",
+                        "months": ["2027-03"],
+                        "low_pct": -12,
+                        "high_pct": -2,
+                        "evidence_tier": "judgment",
+                        "quote": "Port workers begin an indefinite strike",
+                        "citations": [port],
+                        "already_in_forecast": False,
+                        "confidence": "low",
+                        "reasoning": "Jar caps are imported through the port.",
+                        "watch_query": "port strike",
+                    },
+                    {
+                        "name": "Invented boom",
+                        "family_id": "bottles",
+                        "channel": "demand",
+                        "direction": "up",
+                        "months": ["2027-03"],
+                        "low_pct": 5,
+                        "high_pct": 20,
+                        "evidence_tier": "measured",
+                        "quote": "bottled water sales will triple",
+                        "citations": [port],
+                        "already_in_forecast": False,
+                        "confidence": "high",
+                        "reasoning": "Not in any article; must be dropped.",
+                        "watch_query": "boom",
+                    },
+                ]
             data = ReasoningOut.model_validate(
-                {"summary": "Hot spring likely.", "findings": findings, "no_change": quiet}
+                {
+                    "summary": "Hot spring likely.",
+                    "findings": findings,
+                    "new_factors": new_factors,
+                    "no_change": quiet,
+                }
             )
         text = data.model_dump_json()
         return LLMResult(

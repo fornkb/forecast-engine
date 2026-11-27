@@ -1515,3 +1515,13 @@ engine reason   --client demo_aquapure --scenario data/demo/scenarios/aquapure_e
 model. Design, cost model, customization and the full runbook are in
 [docs/reasoning.md](docs/reasoning.md).
 
+The same features are available in a local web app, alongside the CLI:
+
+```powershell
+pip install -e ".[web,openai]"
+engine web                          # opens http://127.0.0.1:8000
+```
+
+Or double-click `web.bat`. `web_preview.bat` shows every page working without an API key,
+using sample answers on a copy of the data.
+

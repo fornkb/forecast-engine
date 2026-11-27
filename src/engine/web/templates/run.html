@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Review {{ run.as_of|day }} · {{ head.name }}{% endblock %}
+{% block crumbs %}
+<a href="/">Portfolio</a><span class="sep">/</span><a href="/c/{{ client_id }}">{{ head.name }}</a><span class="sep">/</span><a href="/c/{{ client_id }}/reviews">External factors</a><span class="sep">/</span><b>{{ run.as_of|day }}</b>
+{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Review of {{ run.as_of|day }}</h1>
+    <p class="lead" style="font-size:15.5px;color:var(--ink-2)">What changed that could affect the forecast, and what evidence do we have?</p>
+    <div class="meta">
+      <span class="pill {{ 'good' if result.complete else 'warn' }}">{{ 'Every source checked' if result.complete else 'Incomplete' }}</span>
+      {% if run.scenario %}<span class="pill warn">Demo scenario</span>{% endif %}
+      <span class="pill plain">Forecast run {{ run.forecast_run_id }} · {{ run.months[0]|month }} – {{ run.months[-1]|month }}</span>
+    </div>
+  </div>
+  <div class="actions">
+    <a class="btn secondary" href="/c/{{ client_id }}/runs/{{ run.reason_id }}/download/html">{{ icon('download') }} Report</a>
+    <a class="btn secondary" href="/c/{{ client_id }}/runs/{{ run.reason_id }}/download/csv" title="Per SKU and month: forecast, low and high. For loading into the ERP.">{{ icon('download') }} Bands CSV</a>
+    <a class="btn ghost sm" href="/c/{{ client_id }}/runs/{{ run.reason_id }}/download/md">Markdown</a>
+    <a class="btn ghost sm" href="/c/{{ client_id }}/runs/{{ run.reason_id }}/download/json">JSON</a>
+  </div>
+</div>
+
+<div class="outcome {{ result.kind }} {{ '' if result.complete else 'incomplete' }}">
+  <div class="icon-box">{{ icon('check' if result.complete and result.kind == 'nothing' else 'reviews' if result.complete else 'alert') }}</div>
+  <div>
+    <h2>{{ result.headline }}.</h2>
+    {% if run.summary %}<p class="summary-text">{{ run.summary }}</p>{% endif %}
+    {% if result.failed or result.not_assessed %}
+    <p class="small strong" style="margin:10px 0 4px">Could not be checked this time</p>
+    <ul class="plain small">
+      {% for detail, labels in result.failed_groups %}<li><b>{{ labels|join('; ') }}</b>. {{ detail }}</li>{% endfor %}
+      {% for item in result.not_assessed %}<li>{{ item }}</li>{% endfor %}
+    </ul>
+    <p class="small muted" style="margin:4px 0 0">Nothing is claimed for these. Run the review again later to fill the gap.</p>
+    {% endif %}
+  </div>
+</div>
+
+{% if run.scenario %}<div class="note warn">{{ icon('info') }}<span><b>Scenario data.</b> {{ run.scenario }}. The signals are illustrative, prepared for a demonstration, not live news.</span></div>{% endif %}
+
+<div class="kpis">
+  <div class="kpi accent">
+    <div class="label">{{ icon('reviews') }} What-if range, total</div>
+    {% if digest.moves %}<div class="value range-val">{{ '%+.1f'|format(digest.low_pct) }}% <small>to</small> {{ '%+.1f'|format(digest.high_pct) }}%</div>
+    <div class="foot-note">{{ digest.low|compact }} – {{ digest.high|compact }} vs {{ digest.baseline|compact }} units</div>
+    {% else %}<div class="value">No change</div><div class="foot-note">Forecast stands as it is</div>{% endif %}
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('forecast') }} Demand findings</div>
+    <div class="value">{{ counts.get('demand', 0) }}</div>
+    <div class="foot-note">{{ result.new_factors }} new factor{{ '' if result.new_factors == 1 else 's' }} not on the watch list</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('alert') }} Cost & supply alerts</div>
+    <div class="value">{{ counts.get('supply_risk', 0) + counts.get('cost', 0) }}</div>
+    <div class="foot-note">Flagged, without changing demand</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('flag') }} Decisions</div>
+    {% set total = digest.open + digest.decided %}
+    <div class="value">{{ digest.decided }} <small>of {{ total }}</small></div>
+    <div class="progress" style="margin-top:10px"><span style="width:{{ (100 * digest.decided / total) if total else 100 }}%"></span></div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('check') }} Sources checked</div>
+    <div class="value">{{ result.checked }}</div>
+    <div class="foot-note">{% if result.missing %}<span class="down">{{ result.missing }} could not be checked</span>{% else %}All worked{% endif %}</div>
+  </div>
+</div>
+
+
+<section class="card flush">
+  <div class="card-head"><div><h2>Impact by product family</h2><div class="sub">Next {{ run.months|length }} months. The what-if band is the forecast if the stated conditions hold; it is not a probability.</div></div></div>
+  <div class="table-wrap" style="margin-top:12px">
+  <table class="table">
+    <thead><tr><th>Family</th><th class="r">Forecast</th><th class="r">What-if band</th><th class="r">Range</th><th>Drivers</th><th></th></tr></thead>
+    <tbody>
+    {% for i in impact %}
+      <tr>
+        <td><span class="cell-title">{{ i.name }}</span><span class="cell-sub">{{ i.series }} SKUs</span></td>
+        <td class="r strong">{{ i.baseline|num }}</td>
+        <td class="r">{{ i.low|num }} – {{ i.high|num }}</td>
+        <td class="r">{% if i.low_pct or i.high_pct %}<span class="range">{{ '%+.1f'|format(i.low_pct) }}% to {{ '%+.1f'|format(i.high_pct) }}%</span>{% else %}<span class="muted">no change</span>{% endif %}</td>
+        <td class="small">{{ i.drivers|map('title_id')|join(', ') or '–' }}</td>
+        <td class="r"><a class="small" href="#fam-{{ i.id }}">Details ↓</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+{% for fam in families %}
+{% set f = fam.summary %}
+<section class="card" id="fam-{{ f.family_id }}">
+  <div class="family-head">
+    <div><h2>{{ f.name }}</h2><div class="sub small muted">{{ f.series_count }} SKUs · {{ fam.findings|length }} finding{{ '' if fam.findings|length == 1 else 's' }}</div></div>
+    <div class="legend" aria-hidden="true"><span><i class="key"></i>Actual</span><span><i class="key forecast"></i>Forecast</span><span><i class="key whatif"></i>What-if band</span>
+      <span class="pill {{ 'good' if fam.moved else 'plain' }}">{{ 'Band applied' if fam.moved else 'Forecast unchanged' }}</span></div>
+  </div>
+  <figure class="chart" data-chart="{{ fam.chart.data }}">{{ fam.chart.svg }}<div class="tip" hidden></div></figure>
+  <details class="more" style="margin-top:10px">
+    <summary><span class="small muted">Month by month</span></summary>
+    <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Month</th><th class="r">Same month last year</th><th class="r">Forecast</th><th class="r">Model range (p10–p90)</th><th class="r">What-if band</th></tr></thead>
+      <tbody>
+      {% for mo in f.months %}
+        <tr><td class="strong">{{ mo.period|month }}</td><td class="r">{{ mo.last_year|num }}</td><td class="r">{{ mo.baseline|num }}</td>
+          <td class="r">{% if mo.p10 is not none %}{{ mo.p10|num }} – {{ mo.p90|num }}{% else %}–{% endif %}</td>
+          <td class="r strong">{{ mo.low|num }} – {{ mo.high|num }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+  {% for finding in fam.findings %}{% include "_finding.html" %}{% else %}
+  <p class="muted small" style="margin-top:12px">No external factor changes this family's forecast this month.</p>
+  {% endfor %}
+</section>
+{% endfor %}
+
+<div class="grid-even">
+  <section class="card">
+    <div class="card-head"><h2>Checked, no change</h2></div>
+    <ul class="plain">
+      {% for q in run.quiet %}<li><b>{{ q.driver_id|title_id }}</b>: {{ q.reason }}</li>{% endfor %}
+      {% if unchanged %}<li><b>{{ unchanged|map('title_id')|join(', ') }}</b>: nothing new since the last review. Earlier findings carried forward at no cost.</li>{% endif %}
+      {% if not run.quiet and not unchanged %}<li class="muted">–</li>{% endif %}
+    </ul>
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>Gaps and limits</h2></div>
+    <ul class="plain">
+      {% for g in run.not_assessed + run.gaps %}<li>{{ g }}</li>{% else %}<li class="muted">None</li>{% endfor %}
+    </ul>
+  </section>
+</div>
+
+<details class="card more">
+  <summary><h2>Drivers and signals</h2></summary>
+  <div class="table-wrap">{% include "_drivers.html" %}</div>
+</details>
+
+<details class="card more">
+  <summary><h2>Sources ({{ run.references|selectattr('kind', 'ne', 'previous')|list|length }})</h2></summary>
+  <ul class="plain small">
+  {% for ref in run.references if ref.kind != 'previous' %}
+    <li><b>{{ ref.id }}</b> <span class="muted">[{{ ref.driver_id }}]</span>
+      {% if ref.url.startswith('http://') or ref.url.startswith('https://') %}<a href="{{ ref.url }}" rel="noopener noreferrer" target="_blank">{{ ref.title[:160] }}</a>{% else %}{{ ref.title[:160] }}{% endif %}
+      <span class="muted">{{ ref.source }}{% if ref.published %} · {{ ref.published }}{% endif %}</span></li>
+  {% else %}<li class="muted">–</li>{% endfor %}
+  </ul>
+</details>
+
+<p class="muted small">{{ run.reason_id }} · {{ run.provider }} {{ run.model or '' }} · {{ used.calls }} AI call{{ '' if used.calls == 1 else 's' }}{% if used.cost is not none %}, about {{ used.cost|money }}{% endif %} · prompt {{ run.prompt_version }} · created {{ run.created_at|when }} UTC{% if run.unassigned_series %} · {{ run.unassigned_series }} SKUs match no family{% endif %}</p>
+{% endblock %}

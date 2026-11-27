@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Company profile · {{ head.name }}{% endblock %}
+{% block content %}
+{% call m.client_header(head, 'profile', '') %}
+  {% if profile and profile.status == 'draft' %}
+  <form method="post" action="/c/{{ client_id }}/profile/confirm"><button>{{ icon('check') }} Mark confirmed</button></form>
+  {% endif %}
+{% endcall %}
+
+{% if job %}<div class="note">{{ icon('clock') }}<span>{{ job.label }} is running. <a href="/c/{{ client_id }}/jobs/{{ job.id }}">Watch progress</a></span></div>{% endif %}
+{% if load_error %}<div class="note err">{{ icon('alert') }}<pre class="error">{{ load_error }}</pre></div>{% endif %}
+
+<p class="muted" style="margin:-8px 0 20px">What the company sells, where, from which inputs, and which external factors (drivers) to watch. Saved in <code>{{ path.name }}</code>.</p>
+
+{% if profile %}
+<div class="grid-2" style="margin-bottom:20px">
+  <section class="card">
+    <div class="card-head"><div><h2>{{ profile.company.name }}</h2><div class="sub">Profile {{ profile.status }}</div></div>
+      <span class="pill {{ 'good' if profile.status == 'confirmed' else 'warn' }}">{{ profile.status|capitalize }}</span></div>
+    <p style="color:var(--ink-2)">{{ profile.company.summary }}</p>
+    <dl class="facts" style="margin-top:12px">
+      <dt>Regions</dt><dd>{% for r in profile.company.regions %}{{ r.name }} ({{ r.country }}){{ ', ' if not loop.last }}{% else %}–{% endfor %}</dd>
+      <dt>Families</dt><dd>{{ profile.families|length }}</dd>
+      <dt>Drivers</dt><dd>{{ resolved|length }} active{% set problems = resolved|selectattr('error')|list %}{% if problems %} · <span class="down">{{ problems|length }} need setup</span>{% endif %}</dd>
+      {% if profile.notes %}<dt>Notes</dt><dd class="small">{{ profile.notes }}</dd>{% endif %}
+    </dl>
+  </section>
+  <section class="card">
+    <div class="card-head"><div><h2>Questions from the AI</h2><div class="sub">Answer all at once; one AI call updates the profile</div></div></div>
+    {% if profile.open_questions %}
+    <ol style="margin:0 0 14px;padding-left:20px;color:var(--ink-2)">{% for q in profile.open_questions %}<li style="margin:4px 0">{{ q }}</li>{% endfor %}</ol>
+    <form method="post" action="/c/{{ client_id }}/onboard/answers" class="form" data-busy>
+      <label class="field">Your answers <textarea name="answers" rows="5" required placeholder="1. …&#10;2. …"></textarea></label>
+      <div class="form-foot">
+        <label class="check"><input type="checkbox" name="confirm" value="true"> Mark the result confirmed</label>
+        <div class="actions">
+          <select name="llm_mode" style="width:auto" aria-label="AI answers">{% for mode in MODES %}<option value="{{ mode }}">{{ mode|capitalize }}</option>{% endfor %}</select>
+          <button>Apply answers</button>
+        </div>
+      </div>
+    </form>
+    {% else %}
+    <div class="empty" style="padding:20px"><p>No open questions.</p></div>
+    {% endif %}
+  </section>
+</div>
+
+<div class="grid-even">
+  <section class="card flush">
+    <div class="card-head"><div><h2>Product families</h2><div class="sub">How SKUs are grouped for reasoning</div></div></div>
+    <div class="table-wrap" style="margin-top:12px">
+    <table class="table">
+      <thead><tr><th>Family</th><th>Matches</th><th class="r">SKUs</th></tr></thead>
+      <tbody>
+      {% for fam in profile.families %}
+        <tr><td><span class="cell-title">{{ fam.name }}</span><span class="cell-sub">{{ fam.id }}{% if fam.inputs %} · inputs: {{ fam.inputs|join(', ') }}{% endif %}</span></td>
+          <td class="small">
+            {% if fam.match.item_group %}Item group {{ fam.match.item_group|join(', ') }}<br>{% endif %}
+            {% if fam.match.item_prefix %}Code starts {{ fam.match.item_prefix|join(', ') }}<br>{% endif %}
+            {% if fam.match.series %}{{ fam.match.series|length }} named series{% endif %}</td>
+          <td class="r strong">{% if has_erp %}{{ coverage.get(fam.id, 0) }}{% else %}–{% endif %}</td></tr>
+      {% endfor %}
+      {% if unassigned %}<tr><td colspan="2" class="down">Not in any family: not reasoned about</td><td class="r strong down">{{ unassigned }}</td></tr>{% endif %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="card flush">
+    <div class="card-head"><div><h2>Drivers</h2><div class="sub">External factors watched for this company</div></div></div>
+    <div class="table-wrap" style="margin-top:12px">
+    <table class="table">
+      <thead><tr><th>Driver</th><th>Families</th><th>Check</th></tr></thead>
+      <tbody>
+      {% for d in resolved %}
+        <tr><td><span class="cell-title">{{ d.id|title_id }} <span class="muted small" style="font-weight:400">{{ d.driver.template }}</span></span>
+            {% if d.driver.mechanism %}<span class="cell-sub">{{ d.driver.mechanism }}</span>{% endif %}</td>
+          <td class="small">{{ d.families|join(', ') or '–' }}</td>
+          <td>{% if d.error %}<span class="pill bad">{{ d.error }}</span>{% else %}<span class="pill good">{{ icon('check') }} OK</span>{% endif %}</td></tr>
+      {% endfor %}
+      {% set disabled = profile.drivers|rejectattr('enabled')|list %}
+      {% if disabled %}<tr><td colspan="3" class="muted small">Disabled: {{ disabled|map(attribute='id')|join(', ') }}</td></tr>{% endif %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+</div>
+{% endif %}
+
+<details class="card more" {% if edit_error or not profile %}open{% endif %} id="edit">
+  <summary><h2>Edit as YAML</h2></summary>
+  {% if edit_error %}<div class="note err">{{ icon('alert') }}<pre class="error">{{ edit_error }}</pre></div>{% endif %}
+  <form method="post" action="/c/{{ client_id }}/profile#edit" class="form">
+    <textarea name="yaml_text" rows="24" class="code" spellcheck="false">{{ text }}</textarea>
+    <div class="form-foot"><span class="small muted">Saved only if it validates. Every save is kept as a version with your name.</span><button>Validate and save</button></div>
+  </form>
+</details>
+
+<details class="card more" {% if not profile %}open{% endif %}>
+  <summary><h2>Draft a profile with AI</h2></summary>
+  <p class="small muted">One AI call reads the ERP product list and sales summary{% if not has_erp %} (no ERP data loaded yet){% endif %}, plus your description, and proposes families and drivers. Unknown templates and item groups are dropped, not trusted.</p>
+  <form method="post" action="/c/{{ client_id }}/onboard" class="form" data-busy>
+    <label class="field">About the company <textarea name="about" rows="5" placeholder="What you make, for whom, where you sell, key raw materials, seasons that matter…"></textarea></label>
+    <div class="form-foot">
+      {% if profile or load_error %}<label class="check"><input type="checkbox" name="replace" value="true"> Replace the current profile</label>{% else %}<span></span>{% endif %}
+      <div class="actions">
+        <select name="llm_mode" style="width:auto" aria-label="AI answers">{% for mode in MODES %}<option value="{{ mode }}">{{ mode|capitalize }}</option>{% endfor %}</select>
+        <button>Draft profile</button>
+      </div>
+    </div>
+  </form>
+</details>
+
+<div class="grid-even">
+  <details class="card more">
+    <summary><h2>Driver templates</h2></summary>
+    <table class="table small">
+      <thead><tr><th>Template</th><th>Watches</th><th>Needs</th></tr></thead>
+      <tbody>{% for t in catalog %}<tr><td><b>{{ t.id }}</b><div class="muted">{{ t.kind }}</div></td><td>{{ t.description }}</td><td>{{ t.required_params|join(', ') or '–' }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </details>
+  <details class="card more">
+    <summary><h2>Saved versions</h2></summary>
+    <table class="table small">
+      <thead><tr><th>Saved</th><th>By</th><th>Version</th></tr></thead>
+      <tbody>{% for ver in versions %}<tr><td>{{ ver.saved_at|when }}</td><td>{{ ver.actor }}</td><td><code>{{ ver.profile_hash[:10] }}</code></td></tr>
+      {% else %}<tr><td colspan="3" class="muted">No saved versions yet.</td></tr>{% endfor %}</tbody>
+    </table>
+  </details>
+</div>
+{% endblock %}

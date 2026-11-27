@@ -1,10 +1,10 @@
 id: monsoon
 kind: weather
-description: Monsoon outlook for a region from seasonal model data and monsoon news.
+listed: false
+description: Rainfall outlook for a region plus rainy-season news. Kept for existing profiles; new profiles use seasonal_weather plus a news search.
 connectors: [weather, news]
 news_query: 'monsoon forecast {region_name}'
 required_params: [region]
 mechanism_hint: >-
-  Monsoon timing and strength move construction activity, agriculture, logistics and
-  seasonal consumption. The normal seasonal dip is already in the forecast; only an
-  unusual monsoon is new information.
+  An unusual rainy season can change activity and consumption; the normal seasonal
+  pattern is already in the forecast.

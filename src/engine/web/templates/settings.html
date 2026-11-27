@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Settings · {{ head.name }}{% endblock %}
+{% block content %}
+{% call m.client_header(head, 'settings', '') %}{% endcall %}
+
+{% if s.error %}<div class="note err">{{ icon('alert') }}<span>{{ s.error }}</span></div>{% endif %}
+
+<div class="grid-2" style="margin-bottom:20px">
+  <section class="card">
+    <div class="card-head"><div><h2>Setup checklist</h2><div class="sub">What a review needs</div></div></div>
+    <ul class="checklist">
+      <li class="{{ 'yes' if s.granularity == 'monthly' else 'no' }}"><span class="mark">{{ '✓' if s.granularity == 'monthly' else '✕' }}</span><b>Monthly forecasts</b><span>{{ s.granularity|capitalize }}{% if s.granularity != 'monthly' %}: reviews need monthly forecasts{% endif %}</span></li>
+      <li class="{{ 'yes' if s.enabled else 'no' }}"><span class="mark">{{ '✓' if s.enabled else '✕' }}</span><b>Reasoning layer</b><span>{% if s.enabled %}On{% else %}Off: add a <code>reasoning:</code> section to <code>config/clients/{{ s.client_id }}.yaml</code> (see <code>demo_aquapure.yaml</code>){% endif %}</span></li>
+      <li class="{{ 'yes' if s.forecast else 'no' }}"><span class="mark">{{ '✓' if s.forecast else '✕' }}</span><b>Saved forecast</b><span>{% if s.forecast %}Run {{ s.forecast.run_id }} · {{ s.forecast.series }} series · {{ s.forecast.months[0]|month }} – {{ s.forecast.months[-1]|month }}{% else %}None yet: <a href="/c/{{ s.client_id }}/forecast">run the forecast</a>{% endif %}</span></li>
+      {% if s.enabled %}
+      <li class="{{ 'yes' if s.profile_status == 'confirmed' else ('warn' if s.profile_status == 'draft' else 'no') }}"><span class="mark">{{ '✓' if s.profile_status == 'confirmed' else ('!' if s.profile_status == 'draft' else '✕') }}</span><b>Company profile</b>
+        <span>{% if s.profile_status in ('draft', 'confirmed') %}{{ s.profile_status|capitalize }} · {{ s.families }} families · {{ s.drivers }} drivers{% elif s.profile_status == 'invalid' %}Does not validate{% else %}Missing{% endif %} · <a href="/c/{{ s.client_id }}/profile">open</a></span></li>
+      {% if s.driver_problems %}<li class="warn"><span class="mark">!</span><b>Driver setup</b><span>{{ s.driver_problems|join('; ') }}</span></li>{% endif %}
+      <li class="{{ 'yes' if s.key_set or s.provider == 'replay' else 'warn' }}"><span class="mark">{{ '✓' if s.key_set or s.provider == 'replay' else '!' }}</span><b>AI provider key</b>
+        <span>{% if s.provider == 'replay' %}Not needed (replay only){% elif s.key_set %}{{ s.key_env }} is set{% else %}{{ s.key_env }} is not set. Set it before starting the app; replay works without it.{% endif %}</span></li>
+      <li class="{{ 'yes' if s.recordings else 'idle' }}"><span class="mark">{{ '✓' if s.recordings else '–' }}</span><b>Recorded answers</b><span>{{ s.recordings }} saved{% if s.recordings %}: demos replay offline at no cost{% else %}: run a review in Record mode to keep its answers{% endif %}</span></li>
+      {% endif %}
+    </ul>
+  </section>
+
+  {% if config %}
+  <section class="card">
+    <div class="card-head"><div><h2>AI model</h2><div class="sub">Per client, any provider</div></div></div>
+    <dl class="facts">
+      <dt>Provider</dt><dd>{{ config.llm.provider }}</dd>
+      <dt>Reasoning model</dt><dd>{{ config.llm.model or 'not set' }}</dd>
+      <dt>Screening model</dt><dd>{{ config.llm.triage_model or 'same as reasoning' }}</dd>
+      <dt>Effort</dt><dd>{{ config.llm.effort or 'provider default' }}</dd>
+      <dt>Key variable</dt><dd><code>{{ config.llm.key_env or '–' }}</code></dd>
+      <dt>AI this month</dt><dd>{{ spend[0]|money }} · {{ spend[1] }} call{{ '' if spend[1] == 1 else 's' }}</dd>
+      <dt>Rates</dt><dd>{% for name, r in config.llm.rates.items() %}{{ name }}: ${{ r.input_per_m }} in / ${{ r.output_per_m }} out per 1M tokens<br>{% else %}not set: cost shows as unknown{% endfor %}</dd>
+    </dl>
+  </section>
+  {% else %}
+  <section class="card"><div class="empty"><h3>Reasoning is off</h3><p>Forecasts work without it. Turn it on to review forecasts against external factors.</p></div></section>
+  {% endif %}
+</div>
+
+{% if config %}
+<div class="grid-even">
+  <section class="card">
+    <div class="card-head"><div><h2>Cost limits</h2><div class="sub">Hard caps for every review</div></div></div>
+    <dl class="facts">
+      <dt>AI calls per review</dt><dd>at most {{ config.budget.max_calls_per_run }}</dd>
+      <dt>Input tokens per call</dt><dd>at most {{ '{:,}'.format(config.budget.max_input_tokens) }}</dd>
+      <dt>AI judgment cap</dt><dd>±{{ config.budget.max_judgment_pct }}% unless measured or sourced; ±{{ config.budget.max_new_factor_pct }}% for new factors</dd>
+      <dt>Open news scan</dt><dd>{{ 'on' if config.sources.scan else 'off' }}: broad searches that catch what no driver covers</dd>
+      <dt>Screen articles above</dt><dd>{{ config.budget.triage_threshold }} articles (cheap model)</dd>
+      <dt>Articles per review</dt><dd>at most {{ config.budget.max_articles }}</dd>
+    </dl>
+  </section>
+  <section class="card">
+    <div class="card-head"><div><h2>Data sources</h2><div class="sub">Fetched without AI, cached {{ config.sources.cache_hours }} h</div></div></div>
+    <dl class="facts">
+      <dt>News</dt><dd>{{ config.sources.news.provider|upper if config.sources.news.provider != 'none' else 'off' }} · last {{ config.sources.news.lookback_days }} days{% if config.sources.news.source_country %} · {{ config.sources.news.source_country }}{% endif %}</dd>
+      <dt>Seasonal weather</dt><dd>{% if config.sources.weather.enabled %}Open-Meteo ({{ config.sources.weather.access }}){% else %}off{% endif %}</dd>
+      <dt>El Niño / La Niña</dt><dd>{% if config.sources.enso %}NOAA CPC{% else %}off{% endif %}</dd>
+      <dt>Festivals</dt><dd>Built-in holiday calendar (offline)</dd>
+      <dt>Timezone</dt><dd>{{ config.timezone }}</dd>
+    </dl>
+  </section>
+</div>
+<p class="small muted">Change these in <code>config/clients/{{ s.client_id }}.yaml</code> under <code>reasoning:</code>, then reload. Keys are read from environment variables and never stored by this app.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Forecast · {{ head.name }}{% endblock %}
+{% block content %}
+{% call m.client_header(head, 'forecast', v.summary, v.digest.open if v.digest else 0) %}
+  {% if f %}<a class="btn secondary" href="/c/{{ head.client_id }}/forecast.csv">{{ icon('download') }} Export CSV</a>{% endif %}
+{% endcall %}
+
+{% if job %}<div class="note">{{ icon('clock') }}<span>{{ job.label }} started {{ job.seconds }} s ago. <a href="/c/{{ head.client_id }}/jobs/{{ job.id }}">Watch progress</a></span></div>{% endif %}
+
+<section class="card">
+  <div class="card-head" style="margin-bottom:0;flex-wrap:wrap">
+    <div><h2>Run the forecast</h2><div class="sub">Uses this client's sales history and the models the backtest picked for each series.{% if f %} Last run {{ f.created_at|when }}.{% endif %}</div></div>
+    {% if can_pipeline %}
+    <div class="actions">
+      <form method="post" action="/c/{{ head.client_id }}/forecast/refresh" class="actions" data-busy>
+        <label class="field" style="flex-direction:row;display:flex;align-items:center;gap:8px;font-weight:550">Months ahead
+          <select name="horizon" style="width:auto">{% for h in [3, 6, 9, 12] %}<option value="{{ h }}" {% if (f and f.months|length == h) or (not f and h == 6) %}selected{% endif %}>{{ h }}</option>{% endfor %}</select>
+        </label>
+        <button>{{ icon('refresh') }} Refresh forecast</button>
+      </form>
+      <form method="post" action="/c/{{ head.client_id }}/backtest" data-busy><button class="secondary" title="Re-scores every model on past data. Takes a few minutes.">{{ icon('target') }} Run backtest</button></form>
+    </div>
+    {% else %}
+    <span class="small muted">{% if preview %}Off in preview mode.{% else %}Run <code>engine forecast --client {{ head.client_id }}</code> in a terminal.{% endif %}</span>
+    {% endif %}
+  </div>
+</section>
+
+{% if not f %}
+<section class="card empty"><h3>No saved forecast yet</h3><p>Load sales history with <code>engine ingest</code>, then refresh the forecast.</p></section>
+{% else %}
+{% set first = f.total[0] %}
+<div class="kpis">
+  <div class="kpi">
+    <div class="label">{{ icon('forecast') }} Next {{ f.months|length }} months</div>
+    <div class="value">{{ f.horizon_total|compact }} <small>units</small></div>
+    <div class="foot-note">{{ m.delta(f.change_pct) }}</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('clock') }} {{ first.period|month }}</div>
+    <div class="value">{{ first.forecast|compact }} <small>units</small></div>
+    <div class="foot-note">{{ m.delta(((first.forecast / first.last_year - 1) * 100) if first.last_year else none) }}</div>
+  </div>
+  <div class="kpi accent">
+    <div class="label">{{ icon('target') }} Accuracy</div>
+    {% if acc %}<div class="value">{{ acc.accuracy_pct }}%</div>
+    <div class="foot-note">Error (WAPE) {{ '%.1f'|format(100 * acc.wape) }}%{% if acc.baseline_wape %} vs {{ '%.1f'|format(100 * acc.baseline_wape) }}% baseline{% endif %}</div>
+    {% else %}<div class="value">–</div><div class="foot-note">Run a backtest to measure it</div>{% endif %}
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('settings') }} Bias</div>
+    {% if acc and acc.bias_pct is not none %}<div class="value">{{ '%+.1f'|format(acc.bias_pct) }}%</div>
+    <div class="foot-note">{{ 'Tends to over-forecast' if acc.bias_pct > 1 else ('Tends to under-forecast' if acc.bias_pct < -1 else 'No systematic lean') }}</div>
+    {% else %}<div class="value">–</div><div class="foot-note">Measured by the backtest</div>{% endif %}
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('summary') }} Coverage</div>
+    <div class="value">{{ f.series }} <small>series</small></div>
+    <div class="foot-note">History to {{ f.cutoff|month }}{% if f.stale %} · <span class="down">new data to {{ f.data_until|month }}</span>{% endif %}</div>
+  </div>
+</div>
+
+<section class="card">
+  <div class="card-head">
+    <div><h2>Total demand</h2><div class="sub">Last 24 months of sales, then the forecast with the model's own uncertainty range</div></div>
+    <div class="legend" aria-hidden="true"><span><i class="key"></i>Actual</span><span><i class="key forecast"></i>Forecast</span><span><i class="key model"></i>Model range (p10–p90)</span></div>
+  </div>
+  <figure class="chart" data-chart="{{ chart.data }}">{{ chart.svg }}<div class="tip" hidden></div></figure>
+  <div class="table-wrap" style="margin-top:16px">
+  <table class="table">
+    <thead><tr><th>Month</th><th class="r">Same month last year</th><th class="r">Forecast</th><th class="r">Model range (p10–p90)</th><th class="r">vs last year</th></tr></thead>
+    <tbody>
+    {% for p in f.total %}
+      <tr><td class="strong">{{ p.period|month }}</td><td class="r">{{ p.last_year|num }}</td><td class="r strong">{{ p.forecast|num }}</td>
+        <td class="r">{% if p.p10 is not none %}{{ p.p10|num }} – {{ p.p90|num }}{% else %}–{% endif %}</td>
+        <td class="r">{% if p.last_year %}{% set c = (p.forecast / p.last_year - 1) * 100 %}<span class="delta {{ 'up' if c >= 0 else 'down' }}">{{ '%+.1f'|format(c) }}%</span>{% else %}–{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<div class="grid-2" style="margin-bottom:20px">
+  <section class="card flush">
+    <div class="card-head"><div><h2>By {{ f.group_label }}</h2><div class="sub">Next {{ f.months|length }} months against the same months last year</div></div></div>
+    <div class="table-wrap" style="margin-top:12px">
+    <table class="table">
+      <thead><tr><th>{{ f.group_label|capitalize }}</th><th>Trend</th><th class="r">Forecast</th><th class="r">Last year</th><th class="r">Change</th></tr></thead>
+      <tbody>
+      {% for g in f.groups %}
+        <tr><td><span class="cell-title">{{ g.name }}</span><span class="cell-sub">{{ g.series }} SKU{{ '' if g.series == 1 else 's' }}</span></td>
+          <td>{{ sparkline(g.history, g.months|map(attribute='forecast')|list) }}</td>
+          <td class="r strong">{{ g.total|num }}</td><td class="r">{{ g.last_year|num }}</td>
+          <td class="r">{% if g.change_pct is not none %}<span class="delta {{ 'up' if g.change_pct >= 0 else 'down' }}">{{ '%+.1f'|format(g.change_pct) }}%</span>{% else %}–{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><div><h2>How accurate is it?</h2>{% if acc %}<div class="sub">Backtest of {{ acc.created_at|day }} · {{ acc.observations }} {{ 'held-out' if acc.scope == 'holdout' else 'scored' }} forecasts</div>{% endif %}</div></div>
+    {% if acc %}
+    <div class="stack" style="gap:14px">
+      {% set top = [acc.wape, acc.baseline_wape or 0]|max %}
+      <div>
+        <div class="card-head" style="margin-bottom:5px"><span class="small"><b>This engine</b> ({{ acc.model }})</span><b class="num small">{{ '%.1f'|format(100 * acc.wape) }}% error</b></div>
+        <div class="split-bar"><span style="width:{{ 100 * acc.wape / top if top else 0 }}%;background:var(--accent)"></span></div>
+      </div>
+      {% if acc.baseline_wape %}
+      <div>
+        <div class="card-head" style="margin-bottom:5px"><span class="small"><b>Simple baseline</b> ({{ acc.baseline }})</span><b class="num small">{{ '%.1f'|format(100 * acc.baseline_wape) }}% error</b></div>
+        <div class="split-bar"><span style="width:{{ 100 * acc.baseline_wape / top if top else 0 }}%;background:var(--faint)"></span></div>
+      </div>
+      {% endif %}
+      {% if acc.gain_pct is not none %}<p class="small" style="margin:0"><b>{{ '%.0f'|format(acc.gain_pct|abs) }}% {{ 'less' if acc.gain_pct >= 0 else 'more' }} error</b> than repeating last year's pattern.</p>{% endif %}
+      {% if acc.segments %}
+      <table class="table">
+        <thead><tr><th>Volume segment</th><th class="r">Error</th><th class="r">Baseline</th></tr></thead>
+        <tbody>{% for name, wape, base in acc.segments %}<tr><td>{{ name }}</td><td class="r">{{ '%.1f'|format(100 * wape) }}%</td><td class="r">{{ '%.1f'|format(100 * base) if base is not none else '–' }}{{ '%' if base is not none }}</td></tr>{% endfor %}</tbody>
+      </table>
+      {% endif %}
+      {% if acc.coverage is not none and acc.nominal %}<p class="small muted" style="margin:0">The model range held {{ '%.0f'|format(100 * acc.coverage) }}% of actual sales (target {{ '%.0f'|format(100 * acc.nominal) }}%).</p>{% endif %}
+      <p class="small muted" style="margin:0">Error is WAPE: total absolute error divided by total sales. Accuracy = 100% − error.</p>
+    </div>
+    {% else %}
+    <div class="empty"><h3>Not measured yet</h3><p>A backtest replays past months to score every model and pick the best one for each series.</p></div>
+    {% endif %}
+  </section>
+</div>
+
+<section class="card flush">
+  <div class="card-head"><div><h2>Largest SKUs</h2><div class="sub">Top {{ f.top_series|length }} by forecast volume over the next {{ f.months|length }} months</div></div>
+    <div class="small muted">Models: {% for name, count in f.models.items() %}{{ name }} ({{ count }}){{ ', ' if not loop.last }}{% endfor %}</div></div>
+  <div class="table-wrap" style="margin-top:12px">
+  <table class="table">
+    <thead><tr><th>Item</th><th>Customer</th><th>{{ f.group_label|capitalize }}</th><th>Model</th><th class="r">Forecast</th><th class="r">vs last year</th></tr></thead>
+    <tbody>
+    {% for s in f.top_series %}
+      <tr><td><span class="cell-title">{{ s.item_code or s.series_id }}</span><span class="cell-sub">{{ s.description }}</span></td>
+        <td class="small">{{ s.customer or '–' }}</td><td class="small">{{ s.group }}</td><td><span class="pill plain">{{ s.model }}</span></td>
+        <td class="r strong">{{ s.total|num }} <span class="muted small">{{ s.unit }}</span></td>
+        <td class="r">{% if s.change_pct is not none %}<span class="delta {{ 'up' if s.change_pct >= 0 else 'down' }}">{{ '%+.1f'|format(s.change_pct) }}%</span>{% else %}–{% endif %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

@@ -68,6 +68,8 @@ class BudgetConfig(StrictModel):
     max_input_tokens: int = Field(default=20000, ge=2000, le=200000)
     # An AI "judgment" estimate can never move the forecast more than this (percent).
     max_judgment_pct: float = Field(default=10.0, gt=0, le=50)
+    # Same, for a new factor found in the open news scan (no watched driver vouches for it).
+    max_new_factor_pct: float = Field(default=5.0, ge=0, le=50)
     # Triage runs only when more articles than this survive the free filters.
     triage_threshold: int = Field(default=12, ge=0, le=200)
     # Articles sent to the reasoning call after triage.
@@ -98,6 +100,8 @@ class SourcesConfig(StrictModel):
     news: NewsSource = Field(default_factory=NewsSource)
     weather: WeatherSource = Field(default_factory=WeatherSource)
     enso: bool = True
+    # Broad news searches each review (the profile's scan topics) to catch what no driver covers.
+    scan: bool = True
     # A JSON file of prepared signals. When set, it replaces live sources (demos and tests).
     scenario_pack: Path | None = None
     cache_hours: int = Field(default=12, ge=0, le=720)

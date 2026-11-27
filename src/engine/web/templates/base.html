@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}{{ PRODUCT }}{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+<script src="{{ url_for('static', path='app.js') }}" defer></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="side" aria-label="Main navigation">
+    <a class="brand" href="/">
+      <span class="logo"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17l5-5 4 3 7-8"/><path d="M15 7h5v5"/></svg></span>
+      <span>{{ PRODUCT }}<small>Demand forecasting console</small></span>
+    </a>
+    <nav class="side-nav">
+      <a class="nav" href="/" {% if section == 'portfolio' %}aria-current="page"{% endif %}>{{ icon('portfolio') }} Portfolio</a>
+    </nav>
+    <div class="side-label">Clients</div>
+    <nav class="side-nav">
+      {% for c in clients_nav %}
+      <a class="nav client" href="/c/{{ c.id }}" {% if client_id == c.id %}aria-current="page"{% endif %} title="{{ c.name }}">
+        <span class="dot {{ c.dot }}" aria-hidden="true"></span><span class="name">{{ c.name }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+    <div class="side-foot">
+      <label>Signed in as (for the audit trail)
+        <input id="planner" value="{{ planner }}" placeholder="Your name" maxlength="60" autocomplete="name">
+      </label>
+      <div class="ver">Local console · data stays on this computer</div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <nav class="crumbs" aria-label="Breadcrumb">
+        {% block crumbs %}
+        <a href="/">Portfolio</a>
+        {% if head %}<span class="sep">/</span><b>{{ head.name }}</b>{% endif %}
+        {% endblock %}
+      </nav>
+      <span class="spacer"></span>
+      <span class="today">{{ today_label }}</span>
+    </header>
+    {% if preview %}
+    <div class="preview-bar" role="note">{{ icon('info') }}<span><b>Preview mode.</b> AI answers are samples written by a script, not by an AI model. It runs on a copy of your data and nothing real is changed.</span></div>
+    {% endif %}
+    <main class="content">
+      {% if ok %}<div class="note ok" role="status">{{ icon('check') }}<span>{{ ok }}</span></div>{% endif %}
+      {% if err %}<div class="note err" role="alert">{{ icon('alert') }}<span>{{ err }}</span></div>{% endif %}
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="foot">{{ PRODUCT }} · The AI proposes, Python checks every number and computes the bands · Saved forecasts are never changed by a review</footer>
+  </div>
+</div>
+</body>
+</html>

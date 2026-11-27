@@ -4,6 +4,5 @@ description: Monthly temperature and rainfall outlook for a region versus its 10
 connectors: [weather]
 required_params: [region]
 mechanism_hint: >-
-  Hotter or drier than normal months can raise demand for cooling, drinks and water,
-  and slow outdoor work; wetter months can do the opposite. Regional model output,
-  not bias-corrected.
+  Months that are unusually hot, cold, wet or dry compared with normal can change demand,
+  production or logistics. Regional model output, not bias-corrected.

@@ -1,9 +1,9 @@
 id: geopolitics_news
 kind: geopolitics
-description: Conflict, sanctions or shipping-route disruption that can affect inputs, freight or export markets.
+description: News search on a conflict, sanction, trade dispute or transport route.
 connectors: [news]
 news_query: '{topic}'
 required_params: [topic]
 mechanism_hint: >-
-  Wars and route closures usually show up first as higher input and freight costs or
-  delays (supply risk), and only later, if at all, as a change in demand.
+  Conflicts and route disruptions usually reach costs, delays and availability first,
+  and demand later, if at all.

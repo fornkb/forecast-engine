@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}Portfolio · {{ PRODUCT }}{% endblock %}
+{% block crumbs %}<b>Portfolio</b>{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Portfolio</h1>
+    <p class="lead">Every client company on {{ PRODUCT }}: what changed in their demand outlook and what needs a decision.</p>
+  </div>
+</div>
+
+<div class="kpis">
+  <div class="kpi">
+    <div class="label">{{ icon('clients') }} Clients</div>
+    <div class="value">{{ kpis.active }} <small>active of {{ kpis.clients }}</small></div>
+    <div class="foot-note">External-factor reviews switched on</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('alert') }} Need attention</div>
+    <div class="value">{{ kpis.attention }}</div>
+    <div class="foot-note">{% if kpis.attention %}Setup, stale data or unreviewed forecasts{% else %}All active clients are in order{% endif %}</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('flag') }} Open decisions</div>
+    <div class="value">{{ kpis.open }}</div>
+    <div class="foot-note">Findings waiting for a planner to accept, edit or dismiss</div>
+  </div>
+  <div class="kpi">
+    <div class="label">{{ icon('reviews') }} Reviewed</div>
+    <div class="value">{{ kpis.reviewed }} <small>of {{ kpis.active }}</small></div>
+    <div class="foot-note">Latest forecast checked against external factors</div>
+  </div>
+  <div class="kpi accent">
+    <div class="label">{{ icon('reviews') }} Changes found</div>
+    <div class="value">{{ kpis.changes }}</div>
+    <div class="foot-note">In the latest reviews{% if kpis.new_factors %}, {{ kpis.new_factors }} not on a watch list{% endif %}</div>
+  </div>
+</div>
+
+<div class="grid-2" style="margin-bottom:22px">
+  <section class="card">
+    <div class="card-head"><div><h2>Needs attention</h2><div class="sub">Most serious first. Click through to act.</div></div></div>
+    {% if feed %}
+    <ul class="alerts">
+      {% for v, item in feed %}
+      <li>
+        <span class="dot {{ item.level }}" aria-hidden="true"></span>
+        <span class="who">{{ v.status.name }}</span>
+        <span class="what">{{ item.text }}</span>
+        {% if item.link %}<a class="go" href="{{ item.link }}">Open →</a>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <div class="empty"><h3>Nothing needs attention</h3><p>Every active client has a fresh forecast and a reviewed outlook.</p></div>
+    {% endif %}
+  </section>
+  <section class="card">
+    <div class="card-head"><div><h2>This cycle</h2><div class="sub">{{ today|month }}</div></div></div>
+    <div class="stack" style="gap:16px">
+      <div>
+        <div class="card-head" style="margin-bottom:6px"><span class="small muted">Forecasts reviewed</span><b class="num">{{ kpis.reviewed }} / {{ kpis.active }}</b></div>
+        <div class="progress"><span style="width:{{ (100 * kpis.reviewed / kpis.active) if kpis.active else 0 }}%"></span></div>
+      </div>
+      {% set decided = views|selectattr('digest')|map(attribute='digest')|sum(attribute='decided') %}
+      {% set total = decided + kpis.open %}
+      <div>
+        <div class="card-head" style="margin-bottom:6px"><span class="small muted">Findings decided</span><b class="num">{{ decided }} / {{ total }}</b></div>
+        <div class="progress"><span style="width:{{ (100 * decided / total) if total else 0 }}%"></span></div>
+      </div>
+      <p class="small muted" style="margin:0">A review costs 0 AI calls when nothing changed and usually 1 when something did. Same inputs return the saved review.</p>
+    </div>
+  </section>
+</div>
+
+<div class="card-head" style="margin-bottom:12px"><h2>Clients</h2><span class="small muted">{{ views|length }} companies</span></div>
+<div class="clients">
+{% for v in views %}
+  {% set s = v.status %}
+  <a class="client-card {{ 'off' if v.level == 'off' }}" href="/c/{{ s.client_id }}">
+    <div class="top">
+      <div class="avatar" aria-hidden="true">{{ m.initials(s.name) }}</div>
+      <div style="flex:1;min-width:0">
+        <div class="title">{{ s.name }}</div>
+        <div class="small muted">{{ s.client_id }} · {{ s.granularity or '–' }}{% if v.forecast %} · {{ v.forecast.series }} series{% endif %}</div>
+      </div>
+      {{ m.level_pill(v.level) }}
+    </div>
+    <div class="headline">
+      {% if s.error %}{{ s.error }}
+      {% elif not s.enabled %}External-factor reviews are off for this client. Forecasts still run.
+      {% elif v.digest %}<b>{{ v.digest.headline }}.</b>
+      {% else %}No external-factor review yet.{% endif %}
+    </div>
+    <div class="stats">
+      <div><b>{% if v.forecast %}{{ v.forecast.horizon_total|compact }}{% else %}–{% endif %}</b>Next {{ v.forecast.months|length if v.forecast else '–' }} months
+        {% if v.forecast and v.forecast.change_pct is not none %}<span class="delta {{ 'up' if v.forecast.change_pct >= 0 else 'down' }}">{{ '%+.1f'|format(v.forecast.change_pct) }}%</span>{% endif %}</div>
+      <div><b>{% if v.accuracy %}{{ v.accuracy.accuracy_pct }}%{% else %}–{% endif %}</b>Accuracy</div>
+      <div><b>{% if v.digest %}{{ v.digest.open }}{% else %}–{% endif %}</b>Open decisions</div>
+    </div>
+    <div class="foot-row">
+      <span>{% if v.digest %}Reviewed {{ v.digest.run.as_of|day }}{% elif v.forecast %}Forecast {{ v.forecast.cutoff|month }} data{% else %}No forecast{% endif %}</span>
+      <span>{% if v.digest and not v.digest.outcome.complete %}Incomplete review {% endif %}→</span>
+    </div>
+  </a>
+{% endfor %}
+</div>
+{% endblock %}

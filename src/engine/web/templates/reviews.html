@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% import "macros.html" as m %}
+{% block title %}External factors · {{ head.name }}{% endblock %}
+{% block content %}
+{% set open_total = rows[0].open if rows else 0 %}
+{% call m.client_header(head, 'reviews', '', open_total) %}{% endcall %}
+
+{% if job %}<div class="note">{{ icon('clock') }}<span>{{ job.label }} started {{ job.seconds }} s ago. <a href="/c/{{ head.client_id }}/jobs/{{ job.id }}">Watch progress</a></span></div>{% endif %}
+
+<div class="grid-2" style="margin-bottom:20px">
+  <section class="card" id="new">
+    <div class="card-head"><div><h2>New review</h2><div class="sub">Check the latest forecast against weather, commodities, festivals, policy and news</div></div></div>
+    {% if not s.ready %}
+    <div class="note warn">{{ icon('alert') }}<span>Finish the setup first: {% if not s.forecast %}save a forecast{% elif s.profile_status not in ('draft', 'confirmed') %}add a company profile{% else %}see Settings{% endif %}. <a href="/c/{{ s.client_id }}/settings">Open settings</a></span></div>
+    {% else %}
+    <form method="post" action="/c/{{ s.client_id }}/review" class="form" data-busy>
+      <div class="form-row">
+        <label class="field">Signals
+          <select name="scenario">
+            <option value="">Live sources (news, weather, NOAA)</option>
+            {% for sc in scenarios %}<option value="{{ sc.value }}">Demo scenario: {{ sc.name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="field">AI answers
+          <select name="llm_mode">
+            <option value="live">Live: ask the model</option>
+            <option value="record">Record: ask and save the answers</option>
+            <option value="replay" {% if not s.key_set and s.recordings %}selected{% endif %}>Replay: saved answers, offline, free</option>
+          </select>
+        </label>
+        <label class="field">Review date <input type="date" name="as_of"></label>
+      </div>
+      <label class="check"><input type="checkbox" name="full" value="true"> Reassess every driver, even those with nothing new since the last review</label>
+      <div class="form-foot">
+        <span class="small muted">{% if s.provider != 'replay' and not s.key_set %}{{ icon('alert') }} {{ s.key_env }} is not set: use Replay or a scenario with recorded answers.{% else %}Leave the date empty for today (or the scenario's own date).{% endif %}</span>
+        <div class="actions">
+          <button name="action" value="estimate" class="secondary">{{ icon('estimate') }} Estimate cost</button>
+          <button name="action" value="run">{{ icon('play') }} Run review</button>
+        </div>
+      </div>
+    </form>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>How a review works</h2></div>
+    <ol class="steps" style="margin:0">
+      <li>Group SKUs into product families</li>
+      <li>Collect signals for each driver (free sources)</li>
+      <li>Skip drivers with nothing new: no cost</li>
+      <li>One AI call reasons over what changed</li>
+      <li>Python checks every citation, quote and cap</li>
+      <li>A planner accepts, edits or dismisses</li>
+    </ol>
+    <p class="small muted" style="margin:14px 0 0">The saved forecast never changes. Reviews add a what-if band next to it.</p>
+  </section>
+</div>
+
+<section class="card flush">
+  <div class="card-head"><div><h2>Reviews</h2><div class="sub">{{ rows|length }} saved, newest first</div></div></div>
+  {% if rows %}
+  <div class="table-wrap" style="margin-top:12px">
+  <table class="table">
+    <thead><tr><th>Date</th><th>Headline</th><th class="r">What-if range</th><th>Decisions</th><th>Checked</th></tr></thead>
+    <tbody>
+    {% for d in rows %}
+      <tr class="link-row" data-href="/c/{{ s.client_id }}/runs/{{ d.run.reason_id }}">
+        <td><a class="cell-title" href="/c/{{ s.client_id }}/runs/{{ d.run.reason_id }}">{{ d.run.as_of|day }}</a><span class="cell-sub">{{ d.run.reason_id }} · forecast run {{ d.run.forecast_run_id }}</span></td>
+        <td class="small" style="max-width:380px">{{ d.headline }}{% if d.run.scenario %} <span class="pill plain">scenario</span>{% endif %}</td>
+        <td class="r">{% if d.moves %}<span class="range">{{ '%+.1f'|format(d.low_pct) }}% to {{ '%+.1f'|format(d.high_pct) }}%</span>{% else %}<span class="muted">no change</span>{% endif %}</td>
+        <td style="min-width:140px">{% set total = d.open + d.decided %}
+          <div class="progress" style="margin-bottom:4px"><span style="width:{{ (100 * d.decided / total) if total else 100 }}%"></span></div>
+          <span class="small muted">{{ d.decided }} of {{ total }} decided</span></td>
+        <td><span class="pill {{ 'good' if d.outcome.complete else 'warn' }}">{{ 'All sources' if d.outcome.complete else d.outcome.missing ~ ' failed' }}</span></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="empty"><h3>No reviews yet</h3><p>Run the first review above. Estimate first if you like: it shows what each source finds today and makes no AI call.</p></div>
+  {% endif %}
+</section>
+{% endblock %}

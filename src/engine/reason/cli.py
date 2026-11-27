@@ -14,24 +14,12 @@ from rich.console import Console
 from rich.table import Table
 
 from engine.reason import store as records
-from engine.reason.llm import LLMError, get_client
-from engine.reason.llm.cost import cost
-from engine.reason.profile import (
-    apply_answers,
-    draft_profile,
-    load_profile,
-    profile_path,
-    save_profile,
-)
+from engine.reason.llm import LLMError
+from engine.reason.outcome import outcome
+from engine.reason.profile import SCAN_ID, profile_path
 from engine.reason.report import render_html, render_markdown, totals
-from engine.reason.run import (
-    Options,
-    apply_override,
-    recordings_path,
-    require_reasoning,
-    run_review,
-)
-from engine.reason.schemas import LLMCall, Override, ReasoningError, ReasonRun
+from engine.reason.run import Options, apply_override, run_onboarding, run_review
+from engine.reason.schemas import Override, ReasoningError, ReasonRun
 
 console = Console()
 ClientOption = Annotated[str, typer.Option("--client", "-c", help="Client profile id.")]
@@ -67,7 +55,8 @@ def print_run(run: ReasonRun) -> None:
         detail = "; ".join(
             (s.summary if s.ok else f"{s.kind}: {s.error}")[:90] for s in state.signals
         )
-        table.add_row(state.driver_id, status[state.status], detail or "–")
+        name = "open news scan" if state.driver_id == SCAN_ID else state.driver_id
+        table.add_row(name, status[state.status], detail or "–")
     console.print(table)
     if run.status == "dry_run":
         estimate = run.estimate
@@ -84,7 +73,7 @@ def print_run(run: ReasonRun) -> None:
         effect = "–" if f.low_pct == f.high_pct == 0 else f"{f.low_pct:+g}%..{f.high_pct:+g}%"
         table.add_row(
             f.finding_id,
-            f.driver_id,
+            f"NEW: {f.new_factor}" if f.new_factor else f.driver_id,
             f.family_id,
             f.channel,
             effect,
@@ -92,15 +81,17 @@ def print_run(run: ReasonRun) -> None:
             f.tier + (" (carried)" if f.carried_from else ""),
         )
     console.print(table)
+    result = outcome(run)
+    colour = "green" if result.complete else "yellow"
+    console.print(f"[bold {colour}]{result.headline}.[/bold {colour}]")
     if run.summary:
         console.print(f"[bold]Summary:[/bold] {run.summary}")
+    for check in result.failed:
+        console.print(f"[red]could not check:[/red] {check.label}: {check.detail}")
     for gap in [*run.not_assessed, *run.gaps]:
         console.print(f"[yellow]gap:[/yellow] {gap}")
     cost = "unknown" if used["cost"] is None else f"{used['cost']:.4f} {used['currency']}"
-    console.print(
-        f"{run.status} · {used['calls']} AI call(s) · {used['input_tokens']:,} in / "
-        f"{used['output_tokens']:,} out tokens · cost {cost}"
-    )
+    console.print(f"{used['calls']} AI call(s) · cost {cost}")
 
 
 def _write(path: Path, text: str) -> None:
@@ -239,60 +230,25 @@ def register_reason_commands(app: typer.Typer, load: Callable) -> None:
         """Draft the company profile from ERP data, or apply the admin's answers (1 AI call)."""
         profile, store = load(client)
         try:
-            config = require_reasoning(profile)
-            if not config.llm.model:
-                raise ReasoningError("Set reasoning.llm.model in the client profile.")
-            model = get_client(config.llm, llm.value, recordings_path(profile))
-            started = datetime.now(UTC)
-            if answers:
-                current = load_profile(profile)
-                draft, result = apply_answers(
-                    profile,
-                    store,
-                    model,
-                    config.llm.model,
-                    config.llm.max_output_tokens,
-                    current,
-                    answers.read_text(encoding="utf-8"),
-                )
-                stage = "onboard_answers"
-            else:
-                if profile_path(profile).exists() and not typer.confirm(
+            if (
+                not answers
+                and profile_path(profile).exists()
+                and not typer.confirm(
                     f"{profile_path(profile)} exists. Replace it with a new draft?", default=False
-                ):
-                    raise typer.Exit()
-                draft, result = draft_profile(
-                    profile,
-                    store,
-                    model,
-                    config.llm.model,
-                    config.llm.max_output_tokens,
-                    about.read_text(encoding="utf-8") if about else "",
                 )
-                stage = "onboard"
+            ):
+                raise typer.Exit()
+            draft, path = run_onboarding(
+                profile,
+                store,
+                about=about.read_text(encoding="utf-8") if about else "",
+                answers=answers.read_text(encoding="utf-8") if answers else None,
+                llm_mode=llm.value,
+                actor=actor,
+                confirm=confirm,
+            )
         except (ReasoningError, LLMError) as exc:
             raise _fail(exc) from exc
-        records.save_call(
-            store,
-            None,
-            LLMCall(
-                call_id=result.request_hash[:12] or "onboard",
-                stage=stage,
-                provider=result.provider,
-                model=result.model,
-                started_at=started,
-                seconds=round((datetime.now(UTC) - started).total_seconds(), 2),
-                usage=result.usage,
-                cost=0.0
-                if result.replayed
-                else cost(result.usage, config.llm.rates.get(result.model)),
-                outcome="replayed" if result.replayed else "ok",
-                request_hash=result.request_hash,
-            ),
-        )
-        if confirm:
-            draft = draft.model_copy(update={"status": "confirmed"})
-        path = save_profile(profile, store, draft, actor)
         console.print(
             f"Saved {draft.status} profile to {path}: {len(draft.families)} families, "
             f"{len(draft.drivers)} drivers."

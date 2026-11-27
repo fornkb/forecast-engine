@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+{% if job.status == 'running' %}
+<section class="card job" data-job="{{ job.id }}">
+  <div class="spinner" aria-hidden="true"></div>
+  <h1>{{ job.label }}…</h1>
+  <p class="muted" style="margin-top:6px"><span data-seconds>{{ job.seconds }}</span> s · this page updates by itself</p>
+  {% if job.kind in ('review', 'estimate') %}
+  <ol class="steps">
+    <li>Pin the saved forecast and group SKUs into families</li>
+    <li>Check every watched source, plus a broad news search</li>
+    <li>Skip drivers with nothing new</li>
+    <li>{% if job.kind == 'estimate' %}Estimate the AI cost (no call is made){% else %}Ask the model about what changed{% endif %}</li>
+    <li>Check citations, quotes and caps; compute the bands</li>
+  </ol>
+  {% elif job.kind == 'forecast' %}
+  <ol class="steps"><li>Load the sales history</li><li>Run the models the backtest picked per series</li><li>Save the forecast and its uncertainty range</li></ol>
+  {% elif job.kind == 'backtest' %}
+  <ol class="steps"><li>Replay past months for every model</li><li>Score accuracy per series and segment</li><li>Pick the best model for each series</li></ol>
+  <p class="small muted" style="margin-top:14px">This can take a few minutes.</p>
+  {% else %}
+  <p class="small muted">One AI call reads the ERP product summary and your description.</p>
+  {% endif %}
+</section>
+{% else %}
+<section class="card">
+  <div class="card-head"><h1 style="font-size:20px">{{ job.label }} failed</h1></div>
+  <div class="note err">{{ icon('alert') }}<pre class="error">{{ job.error }}</pre></div>
+  <a class="btn secondary" href="/c/{{ client_id }}{{ '/forecast' if job.kind in ('forecast', 'backtest') else ('/profile' if job.kind in ('onboard', 'answers') else '/reviews') }}">Back</a>
+</section>
+{% endif %}
+{% endblock %}

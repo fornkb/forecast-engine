@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
-from reason_kit import FakeModel, make_client, seed_store, write_pack
+from reason_kit import FakeModel, article, make_client, seed_store, write_pack
 
 from engine.reason import store as records
+from engine.reason.outcome import outcome
+from engine.reason.profile import SCAN_ID
 from engine.reason.report import render_html, render_markdown
 from engine.reason.run import Options, apply_override, run_review
-from engine.reason.schemas import Override, ReasoningError
+from engine.reason.schemas import Override, ReasoningError, ReasoningOut
 
 
 def _run(client, store, pack, model=None, **kwargs):
@@ -171,3 +174,105 @@ def test_reasoning_must_be_enabled(tmp_path):
     store, _ = seed_store(tmp_path)
     with pytest.raises(ReasoningError, match="not enabled"):
         _run(off, store, write_pack(tmp_path), FakeModel())
+
+
+# --------------------------------------------------------------------------- open scan
+
+
+def _with(pack, **drivers):
+    document = json.loads(pack.read_text(encoding="utf-8"))
+    document["drivers"].update(drivers)
+    pack.write_text(json.dumps(document), encoding="utf-8")
+    return pack
+
+
+SCAN = [
+    {
+        "kind": "news",
+        "summary": "open search",
+        "data": {"query": "bottled water India"},
+        "articles": [
+            article(
+                "https://news.example/port",
+                "Port workers begin an indefinite strike at the main harbour",
+                "Imports of caps and closures are stuck.",
+            )
+        ],
+    }
+]
+
+
+def test_open_scan_raises_a_new_factor_under_stricter_checks(tmp_path):
+    client, (store, _) = make_client(tmp_path), seed_store(tmp_path)
+    model = FakeModel()
+    run = _run(client, store, _with(write_pack(tmp_path), **{SCAN_ID: SCAN}), model)
+
+    ((_, prompt),) = model.prompts
+    assert "OTHER NEWS" in prompt and "Port workers begin" in prompt
+    new = [f for f in run.findings if f.new_factor]
+    assert [f.new_factor for f in new] == ["Port strike"]  # the invented one is dropped
+    port = new[0]
+    assert port.driver_id == "new:port_strike" and port.watch_query == "port strike"
+    assert (port.low_pct, port.high_pct) == (-5, -2)  # new-factor cap, not the 10% one
+    assert "judgment_capped_5pct" in port.flags and port.quote.startswith("Port workers")
+    assert any("Invented boom" in g and "quote" in g for g in run.gaps)
+    band = next(b for b in run.bands if b.series_id == "J1" and b.period.month == 3)
+    assert band.low == pytest.approx(190) and band.high == pytest.approx(196)
+    result = outcome(run)
+    assert result.kind == "changes" and result.complete and result.new_factors == 1
+    assert "1 new factor not on the watch list" in result.headline
+
+    # Nothing new in the scan next month: the new factor is carried, no call needed.
+    again = _run(client, store, _with(write_pack(tmp_path), **{SCAN_ID: SCAN}), model=None)
+    assert again.calls == []
+    assert any(f.new_factor == "Port strike" and f.carried_from for f in again.findings)
+
+
+class QuietModel(FakeModel):
+    """Finds nothing: the normal answer in most months."""
+
+    def generate(self, **kwargs):
+        result = super().generate(**kwargs)
+        if kwargs["schema"] is ReasoningOut:
+            quiet = ReasoningOut(
+                summary="Nothing important changed.", findings=[], new_factors=[], no_change=[]
+            )
+            return result.__class__(**{**result.__dict__, "data": quiet})
+        return result
+
+
+def test_nothing_changed_is_a_normal_complete_result(tmp_path):
+    client, (store, _) = make_client(tmp_path), seed_store(tmp_path)
+    run = _run(client, store, _with(write_pack(tmp_path), **{SCAN_ID: SCAN}), QuietModel())
+    result = outcome(run)
+    assert run.status == "complete" and result.kind == "nothing" and result.complete
+    assert result.headline.startswith("Nothing important changed.")
+
+
+def test_failed_search_is_named_and_never_called_nothing(tmp_path):
+    client, (store, _) = make_client(tmp_path), seed_store(tmp_path)
+    failed = [
+        {
+            "kind": "news",
+            "summary": "open search failed",
+            "data": {"query": "bottled water India"},
+            "ok": False,
+            "error": "GDELT news is limiting requests from this network.",
+        }
+    ]
+    model = QuietModel()
+    run = _run(client, store, _with(write_pack(tmp_path), **{SCAN_ID: failed}), model)
+    result = outcome(run)
+    assert run.status == "partial" and not result.complete and result.kind == "nothing"
+    assert "could not be checked" in result.headline
+    assert not result.headline.startswith("Nothing important changed")
+    assert [c.label for c in result.failed] == ["open news search 'bottled water India'"]
+    assert result.failed_groups == [
+        (
+            "GDELT news is limiting requests from this network.",
+            ["Open news search 'bottled water India'"],
+        )
+    ]
+    assert any(g.startswith("could not check open news search") for g in run.gaps)
+    ((_, prompt),) = model.prompts
+    assert "SOURCES UNAVAILABLE THIS MONTH" in prompt and "limiting requests" in prompt

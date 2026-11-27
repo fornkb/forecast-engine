@@ -1,9 +1,13 @@
 """One monthly reasoning run, end to end, with hard limits on model calls.
 
-    profile + saved forecast → signals → change filter → (triage) → reasoning → checks → bands
+    profile + saved forecast → signals + open news scan → change filter → (triage)
+        → reasoning → checks → bands
 
-Typical cost: 0 model calls when nothing changed, 1 when something did, 2 when
-there is a lot of news to screen. The same inputs twice return the saved run.
+The review answers one question: what changed that could affect this company's
+forecast, and what evidence do we have? Watched drivers are assessed; the open scan
+lets the model raise a development no driver covers (a "new factor"), held to
+stricter checks. Typical cost: 0 model calls when nothing changed, 1 when something
+did, 2 when there is a lot of news to screen. The same inputs twice return the saved run.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 from engine.config.schema import ClientProfile
 from engine.reason import store as records
-from engine.reason.adjust import bands, check, effective, number
+from engine.reason.adjust import bands, check, check_new, effective, number
 from engine.reason.config import ReasoningConfig
 from engine.reason.connectors import Context, http_get
 from engine.reason.connectors.http import HttpTransport
@@ -25,15 +29,22 @@ from engine.reason.connectors.scenario import ScenarioPack
 from engine.reason.forecast import ForecastView, latest_forecast_run, load_forecast
 from engine.reason.llm import LLMClient, LLMError, Mode, get_client
 from engine.reason.llm.cost import cost, estimate_tokens
+from engine.reason.outcome import source_label
 from engine.reason.profile import (
+    SCAN_ID,
     _config_root,
+    apply_answers,
+    draft_profile,
     load_catalog,
     load_profile,
     profile_hash,
     resolve_all,
+    save_profile,
+    scan_driver,
 )
 from engine.reason.reasoner import PROMPT_VERSION, build_packets, header, system_prompt
 from engine.reason.schemas import (
+    CompanyProfile,
     Finding,
     LLMCall,
     Override,
@@ -45,8 +56,8 @@ from engine.reason.schemas import (
     digest,
 )
 from engine.reason.signals import collect, new_articles
+from engine.reason.triage import SCAN_MECHANISM, apply_triage, prefilter, round_robin, triage_prompt
 from engine.reason.triage import SYSTEM as TRIAGE_SYSTEM
-from engine.reason.triage import apply_triage, prefilter, round_robin, triage_prompt
 from engine.store.duckdb_store import EngineStore
 
 
@@ -141,7 +152,8 @@ def _carry(previous: ReasonRun | None, driver_ids: set[str], months: list[date])
     kept = []
     for finding in previous.findings:
         still = [m for m in finding.months if m in months]
-        if finding.driver_id in driver_ids and still and "dismissed" not in finding.flags:
+        tracked = finding.driver_id in driver_ids or (finding.new_factor and SCAN_ID in driver_ids)
+        if tracked and still and "dismissed" not in finding.flags:
             kept.append(
                 finding.model_copy(
                     update={
@@ -198,17 +210,43 @@ def run_review(
         http=options.http,
         history=view.history,
     )
+    # The open scan: broad searches that let the model notice what no driver covers.
+    scan = (
+        scan_driver(profile)
+        if config.sources.scan
+        and config.sources.news.provider != "none"
+        and (scenario is None or scenario.has(SCAN_ID))
+        else None
+    )
     states, stats = collect(
-        drivers, ctx, store, previous, scenario=scenario, cache_hours=config.sources.cache_hours
+        [*drivers, *([scan] if scan else [])],
+        ctx,
+        store,
+        previous,
+        scenario=scenario,
+        cache_hours=config.sources.cache_hours,
     )
 
     by_id = {d.id: d for d in drivers}
-    usable = [s for s in states if s.status in ("changed", "unchanged")]
+    scan_state = next((s for s in states if s.driver_id == SCAN_ID), None)
+    usable = [s for s in states if s.status in ("changed", "unchanged") and s is not scan_state]
     if options.full or previous is None:
         assess = list(usable)
     else:
         assess = [s for s in usable if s.status == "changed"]
     unchanged = [s.driver_id for s in usable if s not in assess]
+    scan_assess = scan_state is not None and (
+        scan_state.status == "changed"
+        or (scan_state.status == "unchanged" and (options.full or previous is None))
+    )
+    if scan_state is not None and scan_state.status == "unchanged" and not scan_assess:
+        unchanged.append(SCAN_ID)
+    unavailable = [
+        f"{source_label(state.driver_id, signal)}: {signal.error}"
+        for state in states
+        for signal in state.signals
+        if not signal.ok
+    ]
     llm = config.llm
     if not llm.model:
         raise ReasoningError("Set reasoning.llm.model in the client profile.")
@@ -224,6 +262,7 @@ def run_review(
             llm.triage_model,
             llm.effort,
             config.budget.model_dump(),
+            config.sources.scan,
             options.full,
             scenario.name if scenario else None,
         ]
@@ -235,24 +274,32 @@ def run_review(
     reason_id = f"R{as_of:%Y%m%d}-{inputs_hash[:6]}"
 
     client_llm = options.client
-    needs_model = bool(assess) and not options.dry_run and config.budget.max_calls_per_run > 0
+    needs_model = (
+        bool(assess or scan_assess) and not options.dry_run and config.budget.max_calls_per_run > 0
+    )
     if client_llm is None and needs_model:
         client_llm = get_client(llm, options.llm_mode, recordings_path(client))
     caller = _Caller(config, store, client_llm, reason_id)
     gaps, not_assessed = [], []
 
     # Articles: only ones no earlier run has seen, after the free filters.
-    articles = prefilter(
-        {s.driver_id: new_articles(s, previous) for s in assess},
-        config.sources.news.max_articles_per_driver,
-    )
+    fresh = {s.driver_id: new_articles(s, previous) for s in assess}
+    if scan_assess:
+        fresh[SCAN_ID] = new_articles(scan_state, previous)  # last: drivers keep shared stories
+    per_driver = config.sources.news.max_articles_per_driver
+    articles = prefilter(fresh, per_driver, {SCAN_ID: 2 * per_driver})
     total = sum(len(v) for v in articles.values())
     triage_model = llm.triage_model or llm.model
     estimate_calls = 0
     if total > config.budget.triage_threshold:
         prompt, index = triage_prompt(
             profile.company.name,
-            {d: (by_id[d].driver.mechanism or by_id[d].template.description) for d in articles},
+            {
+                d: SCAN_MECHANISM
+                if d == SCAN_ID
+                else (by_id[d].driver.mechanism or by_id[d].template.description)
+                for d in articles
+            },
             articles,
         )
         estimate_calls += 1
@@ -280,15 +327,33 @@ def run_review(
             if f.driver_id == state.driver_id and set(f.months) & set(view.months)
         ]
         blocks.append((driver, signals, articles.get(state.driver_id, []), earlier))
-    system = system_prompt(config.budget.max_judgment_pct)
+    watched = {d.id for d in drivers}
+    earlier_new = [
+        f
+        for f in (previous.findings if previous else [])
+        if f.new_factor
+        and "dismissed" not in f.flags
+        and set(f.months) & set(view.months)
+        and f.driver_id.removeprefix("new:") not in watched
+    ]
+    scan_input = None
+    if scan_assess and scan is not None:
+        failed_scan = [x for x in scan_state.signals if not x.ok]
+        scan_input = (scan, failed_scan, articles.get(SCAN_ID, []), earlier_new)
+    cap, new_cap = config.budget.max_judgment_pct, config.budget.max_new_factor_pct
+    system = system_prompt(cap, new_cap)
     packets, skipped = build_packets(
         head,
         blocks,
-        unchanged,
+        [d for d in unchanged if d != SCAN_ID],
         max_tokens=config.budget.max_input_tokens,
         max_packets=max(0, caller.remaining if not options.dry_run else 10),
+        scan=scan_input,
+        unavailable=unavailable,
     )
-    not_assessed += [f"{d}: over the call budget" for d in skipped]
+    not_assessed += [
+        f"{'open news scan' if d == SCAN_ID else d}: over the call budget" for d in skipped
+    ]
 
     findings, quiet, references, summaries = [], [], {}, []
     families_by_driver = {d.id: d.families for d in drivers}
@@ -302,6 +367,7 @@ def run_review(
             "output_tokens_guess": guess.output_tokens,
             "cost_guess": cost(guess, rates),
             "drivers_to_assess": [s.driver_id for s in assess],
+            "open_scan": scan_assess,
             "unchanged": unchanged,
         }
     else:
@@ -311,14 +377,15 @@ def run_review(
             references.update(packet.references)
             if result is None:
                 not_assessed += [
-                    f"{d}: model call failed ({call.outcome})" for d in packet.driver_ids
+                    f"{'open news scan' if d == SCAN_ID else d}: model call failed ({call.outcome})"
+                    for d in packet.driver_ids
                 ]
                 continue
             measured = _measured_index(packet.references, states)
             checked, calm, notes = check(
                 result.data,
                 packet.references,
-                {d: families_by_driver[d] for d in packet.driver_ids},
+                {d: families_by_driver[d] for d in packet.driver_ids if d != SCAN_ID},
                 view.months,
                 config.budget.max_judgment_pct,
                 measured,
@@ -326,20 +393,34 @@ def run_review(
             findings += checked
             quiet += calm
             gaps += notes
+            if SCAN_ID in packet.driver_ids:
+                found, notes = check_new(
+                    result.data.new_factors,
+                    packet.references,
+                    [f.id for f in profile.families],
+                    view.months,
+                    min(cap, new_cap),
+                    watched,
+                )
+                findings += found
+                gaps += notes
+            elif result.data.new_factors:
+                gaps.append(f"ignored {len(result.data.new_factors)} new factors outside the scan")
             summaries.append(result.data.summary)
 
     findings = number([*findings, *_carry(previous, set(unchanged), view.months)])
     band_rows, families, stacked = bands(view, findings)
-    errored = [s for s in states if s.status == "error"]
     gaps += stacked
+    gaps += [f"could not check {item}" for item in unavailable]
     gaps += [
-        f"{s.driver_id}: {next((x.error for x in s.signals if not x.ok), 'error')}" for s in errored
+        f"{'open news scan' if s.driver_id == SCAN_ID else s.driver_id}: no data this month"
+        for s in states
+        if s.status == "no_data"
     ]
-    gaps += [f"{s.driver_id}: no data this month" for s in states if s.status == "no_data"]
     if view.unassigned:
         gaps.append(f"{len(view.unassigned)} SKUs match no family in the profile")
     status = (
-        "dry_run" if options.dry_run else ("partial" if not_assessed or errored else "complete")
+        "dry_run" if options.dry_run else ("partial" if not_assessed or unavailable else "complete")
     )
     run = ReasonRun(
         reason_id=reason_id,
@@ -405,4 +486,62 @@ def apply_override(client: ClientProfile, store: EngineStore, override: Override
     return updated
 
 
-__all__ = ["Options", "apply_override", "recordings_path", "require_reasoning", "run_review"]
+def run_onboarding(
+    client: ClientProfile,
+    store: EngineStore,
+    *,
+    about: str = "",
+    answers: str | None = None,
+    llm_mode: Mode = "live",
+    actor: str = "admin",
+    confirm: bool = False,
+    llm: LLMClient | None = None,
+) -> tuple[CompanyProfile, Path]:
+    """Draft the company profile from ERP data (or apply the admin's answers): 1 model call.
+
+    The call is logged in the ledger and the profile is saved with a version row.
+    """
+    config = require_reasoning(client)
+    if not config.llm.model:
+        raise ReasoningError("Set reasoning.llm.model in the client profile.")
+    model = llm or get_client(config.llm, llm_mode, recordings_path(client))
+    started = datetime.now(UTC)
+    limit = config.llm.max_output_tokens
+    if answers is not None:
+        current = load_profile(client)
+        draft, result = apply_answers(
+            client, store, model, config.llm.model, limit, current, answers
+        )
+        stage = "onboard_answers"
+    else:
+        draft, result = draft_profile(client, store, model, config.llm.model, limit, about)
+        stage = "onboard"
+    records.save_call(
+        store,
+        None,
+        LLMCall(
+            call_id=result.request_hash[:12] or "onboard",
+            stage=stage,
+            provider=result.provider,
+            model=result.model,
+            started_at=started,
+            seconds=round((datetime.now(UTC) - started).total_seconds(), 2),
+            usage=result.usage,
+            cost=0.0 if result.replayed else cost(result.usage, config.llm.rates.get(result.model)),
+            outcome="replayed" if result.replayed else "ok",
+            request_hash=result.request_hash,
+        ),
+    )
+    if confirm:
+        draft = draft.model_copy(update={"status": "confirmed"})
+    return draft, save_profile(client, store, draft, actor)
+
+
+__all__ = [
+    "Options",
+    "apply_override",
+    "recordings_path",
+    "require_reasoning",
+    "run_onboarding",
+    "run_review",
+]

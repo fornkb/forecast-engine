@@ -47,6 +47,7 @@ from engine.store import (
 )
 from engine.store.export import SUPPORTED as EXPORT_FORMATS
 from engine.utils.console import console, log_step
+from engine.web.cli import register_web_command
 
 FORECAST_OUTPUT_COLUMNS = ["series_id", "period", "horizon", "model", "forecast"]
 PREVIEW_ROWS = 8
@@ -70,6 +71,7 @@ def _load(client_id: str) -> tuple[ClientProfile, EngineStore]:
 
 
 register_reason_commands(app, lambda client: _load(client))
+register_web_command(app)
 
 
 def _require_data(store: EngineStore) -> tuple[pl.DataFrame, pl.DataFrame]:
